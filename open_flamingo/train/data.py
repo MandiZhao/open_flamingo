@@ -15,8 +15,8 @@ import webdataset as wds
 from PIL import Image
 import base64
 from scipy.optimize import linear_sum_assignment
-
 from data_utils import *
+
 
 Image.MAX_IMAGE_PIXELS = 1000000000
 N_CHANNELS = 3
@@ -38,6 +38,8 @@ def preprocess_image(sample, image_processor):
     Augmentations: random horizontal flip.
     Normalization handled by wds.
     """
+    if image_processor is None:
+        image_processor = torchvision.transforms.ToTensor()
     image = [image_processor(s).unsqueeze(0) for s in sample]
     image = torch.cat(image, dim=0)
     image = torchvision.transforms.RandomHorizontalFlip(p=0.5)(image)
@@ -69,6 +71,22 @@ def preprocess_laion_text(sample, tokenizer, max_tokens=32):
         truncation="only_first",
         return_tensors="pt",
     )
+    return text["input_ids"], text["attention_mask"]
+
+def preprocess_mujoco_text(sample, tokenizer, max_tokens=32):
+    if tokenizer is None:
+        return torch.tensor([0]), torch.tensor([0])
+    tokenizer.padding_side = "right"
+    sample = [
+        (f"{s.strip()}<|endofchunk|>{tokenizer.eos_token}") for s in sample
+    ] 
+    text = tokenizer(
+        sample,
+        max_length=max_tokens,
+        padding="longest",
+        truncation="only_first",
+        return_tensors="pt",
+    ) 
     return text["input_ids"], text["attention_mask"]
 
 
@@ -144,6 +162,7 @@ def preprocess_interleaved(
     max_num_images,
     max_tokens=256,
 ):
+    
     """
     Preprocess an interleaved image-text sequence, either by calling preprocess_gpt_interleaved (if the sequence
     is ChatGPT-generated) or by preprocessing in this function (if the sequences is from MMC4).
@@ -279,7 +298,7 @@ def get_mmc4_dataset(args, image_processor, tokenizer, epoch=0, floor=False):
     num_samples, num_shards = get_dataset_size(input_shards)
     num_samples = None
     if not num_samples:
-        num_samples = args.train_num_samples_mmc4
+        num_samples = args.train_num_samples_mujoco
         if not num_samples:
             raise RuntimeError(
                 "Currently, number of dataset samples must be specified for training dataset. "
@@ -334,7 +353,7 @@ def get_mmc4_dataset(args, image_processor, tokenizer, epoch=0, floor=False):
         [
             wds.to_tuple("json", handler=log_and_continue),
             wds.map(preprocess_fn, handler=log_and_continue),
-            wds.batched(args.batch_size_mmc4, partial=False),
+            wds.batched(args.batch_size_mujoco, partial=False),
         ]
     )
 
@@ -345,7 +364,7 @@ def get_mmc4_dataset(args, image_processor, tokenizer, epoch=0, floor=False):
         ), "number of shards must be >= total workers"
     # roll over and repeat a few samples to get same number of full batches on each node
     round_fn = math.floor if floor else math.ceil
-    global_batch_size = args.batch_size_mmc4 * args.world_size
+    global_batch_size = args.batch_size_mujoco * args.world_size
     num_batches = round_fn(num_samples / global_batch_size)
     num_workers = max(1, args.workers)
     num_worker_batches = round_fn(num_batches / num_workers)  # per dataloader worker
@@ -470,6 +489,126 @@ def get_laion_dataset(args, image_processor, tokenizer, epoch=0, floor=False):
 
     return DataInfo(dataloader=dataloader, shared_epoch=shared_epoch)
 
+def get_mujoco_dataset(args, image_processor, tokenizer, epoch=0, floor=False):
+    """
+    Initialize webdataset for MuJoCo sim2real data
+    Instead of downloading from web url, assume the data is saved locally
+    """
+    
+    input_shards = args.mujoco_shards
+    assert input_shards is not None
+    resampled = getattr(args, "dataset_resampled", False)
+
+    num_samples, num_shards = get_dataset_size(input_shards)
+    if not num_samples:
+        num_samples = args.train_num_samples_mujoco
+        if not num_samples:
+            raise RuntimeError(
+                "Currently, number of dataset samples must be specified for training dataset. "
+                "Please specify via `--train-num-samples` if no dataset length info present."
+            )
+
+    # create a shared epoch store to sync epoch to dataloader worker proc
+    shared_epoch = SharedEpoch(epoch=epoch)
+    if resampled:
+        pipeline = [
+            ResampledShards2(input_shards, deterministic=True, epoch=shared_epoch)
+        ]
+    else:
+        pipeline = [wds.SimpleShardList(input_shards)]
+
+    def process_mujoco_images_and_text(inp, num_cameras=4):
+        """ sample seg images"""
+        inp = inp[0] 
+        image_names = inp["images"].keys()
+        np_random = np.random.RandomState(
+            args.seed
+        )
+        sampled_names = []
+        for i in range(num_cameras):
+            img_names = [name for name in image_names if f"camera_{i}" in name]
+            sampled_names.append(np_random.choice(img_names))
+        images = []
+        for k in sampled_names:
+            base_str = inp["images"][k]
+            rawbytes = base64.b64decode(base_str)
+            image = Image.open(io.BytesIO(rawbytes)).convert("RGB")
+            images.append(image)
+        images = preprocess_image(images, image_processor)
+        ids, mask = preprocess_mujoco_text(
+            [inp["text"]], 
+            tokenizer)
+        ids = ids.squeeze(0)
+        mask = mask.squeeze(0)
+        return images, ids, mask
+
+    # at this point we have an iterator over all the shards
+    if not resampled:
+        pipeline.extend(
+            [
+                detshuffle2(
+                    bufsize=_SHARD_SHUFFLE_SIZE,
+                    initial=_SHARD_SHUFFLE_INITIAL,
+                    seed=args.seed,
+                    epoch=shared_epoch,
+                ),
+                wds.split_by_node,
+                wds.split_by_worker,
+            ]
+        )
+    pipeline.extend(
+        [
+            # at this point, we have an iterator over the shards assigned to each worker at each node
+            # wds.tarfile_to_samples(handler=log_and_continue),
+            tarfile_to_samples_nothrow,
+            wds.shuffle(
+                bufsize=_SAMPLE_SHUFFLE_SIZE,
+                initial=_SAMPLE_SHUFFLE_INITIAL,
+            ),
+        ]
+    )
+
+    pipeline.extend(
+        [
+            # wds.select(filter_no_caption_or_no_image),
+            wds.decode("pilrgb", handler=log_and_continue),
+            wds.to_tuple("json"),
+            wds.map(process_mujoco_images_and_text), 
+            wds.batched(args.batch_size_mujoco, partial=False), 
+           
+        ]
+    )
+
+    dataset = wds.DataPipeline(*pipeline)
+    if not resampled:
+        assert (
+            num_shards >= args.workers * args.world_size
+        ), "number of shards must be >= total workers"
+    # roll over and repeat a few samples to get same number of full batches on each node
+    round_fn = math.floor if floor else math.ceil
+    global_batch_size = args.batch_size_mujoco * args.world_size
+    num_batches = round_fn(num_samples / global_batch_size)
+    num_workers = max(1, args.workers)
+    num_worker_batches = round_fn(num_batches / num_workers)  # per dataloader worker
+    num_batches = num_worker_batches * num_workers
+    num_samples = num_batches * global_batch_size
+    # each worker is iterating over this
+    dataset = dataset.with_epoch(num_worker_batches)
+
+    dataloader = wds.WebLoader(
+        dataset,
+        batch_size=None,
+        shuffle=False,
+        num_workers=args.workers,
+        persistent_workers=True,
+    )
+
+    # add meta-data to dataloader instance for convenience
+    dataloader.num_batches = num_batches
+    dataloader.num_samples = num_samples
+
+    return DataInfo(dataloader=dataloader, shared_epoch=shared_epoch)
+
 
 def get_dataset_fn(dataset_type):
     """
@@ -479,6 +618,8 @@ def get_dataset_fn(dataset_type):
         return get_laion_dataset
     elif dataset_type == "mmc4":
         return get_mmc4_dataset
+    elif dataset_type == "mujoco":
+        return get_mujoco_dataset
     else:
         raise ValueError(f"Unsupported dataset type: {dataset_type}")
 

@@ -279,6 +279,236 @@ def train_one_epoch(
             )
 
 
+def train_one_mujoco_epoch(
+    args,
+    model,
+    epoch,
+    mujoco_loader, 
+    tokenizer,
+    optimizer,
+    lr_scheduler,
+    device_id,
+    wandb,
+):
+    num_batches_per_epoch = mujoco_loader.num_batches
+    total_training_steps = num_batches_per_epoch * args.num_epochs
+    autocast = get_autocast(
+        args.precision, cache_enabled=(not args.fsdp)
+    )  # if fsdp, disable cache to save memory
+    cast_dtype = get_cast_dtype(args.precision)
+
+    # setup model
+    media_token_id = tokenizer("<image>", add_special_tokens=False)["input_ids"][-1]
+    endofchunk_token_id = tokenizer("<|endofchunk|>", add_special_tokens=False)[
+        "input_ids"
+    ][-1]
+    model.train()
+
+    # setup logging
+    step_time_m = AverageMeter()
+    data_time_m = AverageMeter()
+    end = time.time()
+
+    for num_steps, batch in tqdm(
+        enumerate(mujoco_loader),
+        disable=args.rank != 0,
+        total=total_training_steps,
+        initial=(epoch * num_batches_per_epoch),
+    ):
+        data_time_m.update(time.time() - end)
+        global_step = num_steps + epoch * num_batches_per_epoch
+
+        #### FORWARD PASS ####
+        print(f"==== Step {num_steps+1}/{num_batches_per_epoch} ====")
+        images = batch[0].to(device_id, dtype=cast_dtype, non_blocking=True)
+        images = rearrange(images, "b (t f) c h w -> b t f c h w", f=1)
+        input_ids = batch[1].to(device_id, dtype=cast_dtype, non_blocking=True)
+        attention_mask = batch[2].to(
+            device_id, dtype=cast_dtype, non_blocking=True
+        )
+        # set up labels; language model is expected to handle shifting
+        labels = input_ids.clone()
+        labels[labels == tokenizer.pad_token_id] = -100
+        labels[labels == tokenizer.eos_token] = -100
+        labels[labels == media_token_id] = -100
+        labels = labels.to(device_id)
+        
+        # gradient accumulation w/ fsdp cpu offloading requires a no_sync context manager
+        with autocast():
+            loss = model(
+                vision_x=images,
+                lang_x=input_ids,
+                attention_mask=attention_mask,
+                labels=labels,
+            )[0]
+
+        divided_loss = loss / args.gradient_accumulation_steps
+        (divided_loss * args.loss_multiplier_mujoco).backward()
+        if (not args.freeze_lm_embeddings) and (
+            not args.fsdp or args.fsdp_use_orig_params
+        ):
+            # Mask gradients for input embeddings s.t. we only update the added tokens <image> and <|endofchunk|>
+            if args.fsdp:
+                embed_grad = model.lang_encoder.get_input_embeddings().weight.grad
+            else:
+                embed_grad = (
+                    model.module.lang_encoder.get_input_embeddings().weight.grad
+                )
+            zero_mask = torch.zeros_like(embed_grad)
+            zero_mask[media_token_id] = torch.ones_like(zero_mask[media_token_id])
+            zero_mask[endofchunk_token_id] = torch.ones_like(
+                zero_mask[endofchunk_token_id]
+            )
+            if args.fsdp:
+                model.lang_encoder.get_input_embeddings().weight.grad = (
+                    embed_grad * zero_mask
+                )
+            else:
+                model.module.lang_encoder.get_input_embeddings().weight.grad = (
+                    embed_grad * zero_mask
+                )
+        if args.fsdp:
+            model.clip_grad_norm_(1.0)
+        else:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        
+        # step optimizer and log
+        if (((num_steps + 1) % args.gradient_accumulation_steps) == 0) or (
+            num_steps == num_batches_per_epoch - 1
+        ):
+            optimizer.step()
+            lr_scheduler.step()
+            optimizer.zero_grad(set_to_none=True)
+
+            # step time and reset end outside of rank 0
+            step_time_m.update(time.time() - end)
+            end = time.time()
+
+            # rank 0 logging
+            if args.rank == 0 and args.report_to_wandb:
+                samples_per_second = (
+                    args.gradient_accumulation_steps
+                    * args.batch_size_mujoco
+                    * args.world_size
+                    / step_time_m.val
+                )
+                samples_per_second_per_gpu = (
+                    args.gradient_accumulation_steps
+                    * args.batch_size_mujoco
+                    / step_time_m.val
+                )
+                wandb.log(
+                    {
+                        "data_time": data_time_m.avg,
+                        "step_time": step_time_m.avg,
+                        "samples_per_second": samples_per_second,
+                        "samples_per_second_per_gpu": samples_per_second_per_gpu,
+                        "lr": optimizer.param_groups[0]["lr"],
+                    },
+                    commit=False,
+                )
+                step_time_m.reset()
+                data_time_m.reset()
+
+                wandb.log(
+                    {
+                        "loss": loss.item(),
+                        "global_step": global_step,
+                    },
+                    commit=True,
+                ) 
+         # Log loss to console
+        if ((num_steps + 1) % args.logging_steps == 0) and args.rank == 0:
+            print(
+                f"Step {num_steps+1}/{num_batches_per_epoch} of epoch {epoch+1}/{args.num_epochs} complete. Loss: {loss.item():.3f}"
+            )
+
+def validate_one_mujoco_epoch(
+    args,
+    model,
+    epoch,
+    tokenizer,
+    optimizer,
+    lr_scheduler, 
+    val_loader,
+    device_id,
+    wandb,
+):
+    num_batches_per_epoch = val_loader.num_batches 
+    autocast = get_autocast(
+        args.precision, cache_enabled=(not args.fsdp)
+    )  # if fsdp, disable cache to save memory
+    cast_dtype = get_cast_dtype(args.precision)
+
+    # setup model
+    media_token_id = tokenizer("<image>", add_special_tokens=False)["input_ids"][-1]
+    endofchunk_token_id = tokenizer("<|endofchunk|>", add_special_tokens=False)[
+        "input_ids"
+    ][-1]
+    model.eval()
+
+    # setup logging
+    step_time_m = AverageMeter()
+    data_time_m = AverageMeter()
+    end = time.time()
+
+    total_val_loss = 0
+    total_val_steps = 0
+    for num_steps, batch in tqdm(
+        enumerate(val_loader),
+        disable=args.rank != 0, 
+    ):
+        data_time_m.update(time.time() - end)
+        global_step = num_steps + epoch * num_batches_per_epoch
+        
+        with torch.inference_mode():
+            images = batch[0].to(device_id, dtype=cast_dtype, non_blocking=True)
+            images = rearrange(images, "b (t f) c h w -> b t f c h w", f=1)
+            input_ids = batch[1].to(device_id, dtype=cast_dtype, non_blocking=True)
+            attention_mask = batch[2].to(
+                device_id, dtype=cast_dtype, non_blocking=True
+            )
+            # set up labels; language model is expected to handle shifting
+            labels = input_ids.clone()
+            labels[labels == tokenizer.pad_token_id] = -100
+            labels[labels == tokenizer.eos_token] = -100
+            labels[labels == media_token_id] = -100
+            labels = labels.to(device_id)
+            # gradient accumulation w/ fsdp cpu offloading requires a no_sync context manager
+            with autocast():
+                loss = model(
+                    vision_x=images,
+                    lang_x=input_ids,
+                    attention_mask=attention_mask,
+                    labels=labels,
+                )[0]
+            total_val_loss += loss.item()
+            total_val_steps += 1
+
+            # step time and reset end outside of rank 0
+        step_time_m.update(time.time() - end)
+        end = time.time()
+        step_time_m.reset()
+        data_time_m.reset()
+
+        
+    # rank 0 logging
+    if args.rank == 0 and args.report_to_wandb: 
+        wandb.log(
+            {
+                "val/data_time": data_time_m.avg,
+                "val/step_time": step_time_m.avg,
+                "val/loss": total_val_loss / total_val_steps,
+                "val/globle_stop": global_step,
+            },
+            commit=True,
+        ) 
+    model.train()
+    print('Done validating', f"Validation  Loss: {loss.item():.3f}")
+    return 
+
+
+
 class AverageMeter(object):
     """Computes and stores the average and current value"""
 

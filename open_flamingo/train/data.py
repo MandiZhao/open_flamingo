@@ -73,20 +73,36 @@ def preprocess_laion_text(sample, tokenizer, max_tokens=32):
     )
     return text["input_ids"], text["attention_mask"]
 
-def preprocess_mujoco_text(sample, tokenizer, max_tokens=32):
+def preprocess_mujoco_text(sample, tokenizer, max_tokens=1024, is_val=False):
     if tokenizer is None:
         return torch.tensor([0]), torch.tensor([0])
     tokenizer.padding_side = "right"
-    sample = [
-        (f"{s.strip()}<|endofchunk|>{tokenizer.eos_token}") for s in sample
-    ] 
-    text = tokenizer(
-        sample,
-        max_length=max_tokens,
-        padding="longest",
-        truncation="only_first",
-        return_tensors="pt",
-    ) 
+    if not is_val:
+        sample = [
+            (f"{s.strip()}<|endofchunk|>{tokenizer.eos_token}") for s in sample
+        ] 
+        text = tokenizer(
+            sample,
+            max_length=max_tokens,
+            # padding="longest",
+            padding="max_length",
+            return_tensors="pt",
+            # truncation="only_first",
+            truncation=True,
+        ) 
+    else:
+        sample = [
+            (f"{s.strip()}") for s in sample
+        ] 
+        text = tokenizer(
+            sample,
+            max_length=1024,
+            padding="longest",
+            # padding="max_length",
+            return_tensors="pt",
+            # truncation="only_first",
+            truncation=True,
+        ) 
     return text["input_ids"], text["attention_mask"]
 
 
@@ -387,7 +403,6 @@ def get_mmc4_dataset(args, image_processor, tokenizer, epoch=0, floor=False):
 
     return DataInfo(dataloader=dataloader, shared_epoch=shared_epoch)
 
-
 def get_laion_dataset(args, image_processor, tokenizer, epoch=0, floor=False):
     """
     Initialize webdataset for LAION data
@@ -517,30 +532,45 @@ def get_mujoco_dataset(args, image_processor, tokenizer, epoch=0, floor=False):
     else:
         pipeline = [wds.SimpleShardList(input_shards)]
 
-    def process_mujoco_images_and_text(inp, num_cameras=4):
+    def process_mujoco_images_and_text(inp, num_cameras=1, num_joints=3):
         """ sample seg images"""
         inp = inp[0] 
         image_names = inp["images"].keys()
+        
         np_random = np.random.RandomState(
             args.seed
         )
-        sampled_names = []
-        for i in range(num_cameras):
-            img_names = [name for name in image_names if f"camera_{i}" in name]
-            sampled_names.append(np_random.choice(img_names))
+        sampled_joint = np_random.choice(range(num_joints))
+        image_names = [name for name in image_names if "seg" in name and f"joint_{sampled_joint}" in name]
+        sampled_idxs = np_random.choice(len(image_names), num_cameras, replace=False)
+        sampled_names = [image_names[i] for i in sampled_idxs]
         images = []
         for k in sampled_names:
             base_str = inp["images"][k]
             rawbytes = base64.b64decode(base_str)
             image = Image.open(io.BytesIO(rawbytes)).convert("RGB")
             images.append(image)
+        
+        # make the <image> token match the number of images
+        inp["text"] = inp["text"].split("<image>")[0] + "<image>" * len(images) + inp["text"].split("<image>")[-1]
+        if args.is_val: 
+            break_str = "model = mjcf.RootElement(model='object')"
+            raw_text = inp["text"]
+            inp["text"] = inp["text"].split(break_str)[0] + "\n" + break_str
+            
+        
         images = preprocess_image(images, image_processor)
         ids, mask = preprocess_mujoco_text(
             [inp["text"]], 
-            tokenizer)
+            tokenizer,
+            is_val=args.is_val,
+            )
         ids = ids.squeeze(0)
         mask = mask.squeeze(0)
-        return images, ids, mask
+        if args.is_val: 
+            return images, ids, mask, raw_text
+        else:
+            return images, ids, mask
 
     # at this point we have an iterator over all the shards
     if not resampled:
@@ -608,7 +638,6 @@ def get_mujoco_dataset(args, image_processor, tokenizer, epoch=0, floor=False):
     dataloader.num_samples = num_samples
 
     return DataInfo(dataloader=dataloader, shared_epoch=shared_epoch)
-
 
 def get_dataset_fn(dataset_type):
     """

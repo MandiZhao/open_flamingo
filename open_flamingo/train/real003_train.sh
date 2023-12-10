@@ -1,8 +1,8 @@
 # NOTE: on real005, IPV4 issue seems to go away with: export NCCL_SOCKET_IFNAME=enp37s0f0; export MASTER_ADR=172.24.72.83  
 export WDS_CACHE_SIZE=800
 export WDS_CACHE=/local/real/mandi/model_cache
-export WORLD_SIZE=4
-export CUDA_VISIBLE_DEVICES=0,1,2,3
+export WORLD_SIZE=8
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 torchrun --nnodes=1 --nproc_per_node=${WORLD_SIZE}  real2code_train.py \
   --lm_path /home/mandi/codellama/CodeLlama-7b \
   --tokenizer_path /home/mandi/codellama/CodeLlama-7b \

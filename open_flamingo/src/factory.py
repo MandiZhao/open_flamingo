@@ -39,6 +39,7 @@ def create_model_and_transforms(
         Image processor: Pipeline to preprocess input images
         Tokenizer: A tokenizer for the language model
     """
+    # print("loading vision encoder")
     vision_encoder, _, image_processor = open_clip.create_model_and_transforms(
         clip_vision_encoder_path,
         pretrained=clip_vision_encoder_pretrained,
@@ -46,7 +47,7 @@ def create_model_and_transforms(
     )
     # set the vision encoder to output the visual features
     vision_encoder.visual.output_tokens = True
-
+    # print("done with vision encoder, now loading language encoder")
     text_tokenizer = AutoTokenizer.from_pretrained(
         tokenizer_path,
         local_files_only=use_local_files,
@@ -88,7 +89,7 @@ def create_model_and_transforms(
         decoder_layers_attr_name = _infer_decoder_layers_attr_name(lang_encoder)
     lang_encoder.set_decoder_layers_attr_name(decoder_layers_attr_name)
     lang_encoder.resize_token_embeddings(len(text_tokenizer))
-
+    print("initialized Flamingo model")
     model = Flamingo(
         vision_encoder,
         lang_encoder,
@@ -135,6 +136,7 @@ __KNOWN_DECODER_LAYERS_ATTR_NAMES = {
     "gpt-j": "transformer.h",
     "pythia": "gpt_neox.layers",
     "llama": "model.layers",
+    "code_llama": "model.layers",
     "gptneoxforcausallm": "gpt_neox.layers",
     "mpt": "transformer.blocks",
     "mosaicgpt": "transformer.blocks",

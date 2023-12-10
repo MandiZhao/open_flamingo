@@ -35,7 +35,7 @@ class EvalModel(BaseEvalModel):
             if ("device" in model_args and model_args["device"] >= 0)
             else "cpu"
         )
-
+        self.device = torch.device(self.device) if self.device == "cpu" else torch.device(f"cuda:{self.device}")
         (
             self.model,
             self.image_processor,
@@ -46,12 +46,14 @@ class EvalModel(BaseEvalModel):
             model_args["lm_path"],
             model_args["lm_tokenizer_path"],
             cross_attn_every_n_layers=int(model_args["cross_attn_every_n_layers"]),
+            cache_dir=model_args.get('cache_dir', None),
         )
-        checkpoint = torch.load(model_args["checkpoint_path"], map_location=self.device)
-        if "model_state_dict" in checkpoint:
-            checkpoint = checkpoint["model_state_dict"]
-            checkpoint = {k.replace("module.", ""): v for k, v in checkpoint.items()}
-        self.model.load_state_dict(checkpoint, strict=False)
+        if model_args.get("checkpoint_path", None):
+            checkpoint = torch.load(model_args["checkpoint_path"], map_location=self.device)
+            if "model_state_dict" in checkpoint:
+                checkpoint = checkpoint["model_state_dict"]
+                checkpoint = {k.replace("module.", ""): v for k, v in checkpoint.items()}
+            self.model.load_state_dict(checkpoint, strict=False)
         self.model.to(self.device)
         self.model.eval()
         self.tokenizer.padding_side = "left"

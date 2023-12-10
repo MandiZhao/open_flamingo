@@ -98,6 +98,7 @@ def main():
     )
     parser.add_argument("--loss_multiplier_mmc4", type=float, default=1.0)
     parser.add_argument("--loss_multiplier_laion", type=float, default=1.0)
+    
     parser.add_argument("--warmup_steps", default=5000, type=int)
     parser.add_argument("--weight_decay", default=0.1, type=float)
     parser.add_argument(

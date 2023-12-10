@@ -385,7 +385,7 @@ def train_one_mujoco_epoch(
             end = time.time()
 
             # rank 0 logging
-            if args.rank == 0 and args.report_to_wandb:
+            if args.rank == 0 and args.report_to_wandb and (num_steps + 1) % args.logging_steps == 0:
                 samples_per_second = (
                     args.gradient_accumulation_steps
                     * args.batch_size_mujoco
@@ -414,6 +414,7 @@ def train_one_mujoco_epoch(
                     {
                         "loss": loss.item(),
                         "global_step": global_step,
+                        "epoch": epoch,
                     },
                     commit=True,
                 ) 
@@ -440,12 +441,13 @@ def validate_one_mujoco_epoch(
     )  # if fsdp, disable cache to save memory
     cast_dtype = get_cast_dtype(args.precision)
 
-    # setup model
-    media_token_id = tokenizer("<image>", add_special_tokens=False)["input_ids"][-1]
-    endofchunk_token_id = tokenizer("<|endofchunk|>", add_special_tokens=False)[
-        "input_ids"
-    ][-1]
+    
     model.eval()
+    with torch.inference_mode():
+        media_token_id = tokenizer("<image>", add_special_tokens=False)["input_ids"][-1]
+        endofchunk_token_id = tokenizer("<|endofchunk|>", add_special_tokens=False)[
+            "input_ids"
+        ][-1]
 
     # setup logging
     step_time_m = AverageMeter()
@@ -474,14 +476,17 @@ def validate_one_mujoco_epoch(
             labels[labels == tokenizer.eos_token] = -100
             labels[labels == media_token_id] = -100
             labels = labels.to(device_id)
+            labels.detach()
             # gradient accumulation w/ fsdp cpu offloading requires a no_sync context manager
-            with autocast():
-                loss = model(
-                    vision_x=images,
-                    lang_x=input_ids,
-                    attention_mask=attention_mask,
-                    labels=labels,
-                )[0]
+            with torch.no_grad(): 
+                with autocast(): 
+                    loss = model(
+                        vision_x=images,
+                        lang_x=input_ids,
+                        attention_mask=attention_mask,
+                        labels=labels,
+                    )[0]
+
             total_val_loss += loss.item()
             total_val_steps += 1
 

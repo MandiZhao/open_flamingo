@@ -107,7 +107,7 @@ class Flamingo(nn.Module):
             # Case: do not use caching (i.e. this is a standard forward pass);
             self._encode_vision_x(vision_x=vision_x)
             self._condition_media_locations(input_ids=lang_x)
-
+        
         output = self.lang_encoder(
             input_ids=lang_x,
             attention_mask=attention_mask,
@@ -115,7 +115,7 @@ class Flamingo(nn.Module):
             past_key_values=past_key_values,
             use_cache=use_cache,
         )
-
+        
         if clear_conditioned_layers:
             self.lang_encoder.clear_conditioned_layers()
 
@@ -154,14 +154,17 @@ class Flamingo(nn.Module):
         Returns:
             torch.Tensor: lang_x with generated tokens appended to it
         """
+        # print("Input shapes", vision_x.shape, lang_x.shape)
         num_beams = kwargs.pop("num_beams", 1)
         if num_beams > 1:
             vision_x = vision_x.repeat_interleave(num_beams, dim=0)
 
         self.lang_encoder._use_cached_vision_x = True
+        # print('Encoding vision X')
         self._encode_vision_x(vision_x=vision_x)
 
         eos_token_id = kwargs.pop("eos_token_id", self.eoc_token_id)
+        # print('Lang encoder generate')
         output = self.lang_encoder.generate(
             input_ids=lang_x,
             attention_mask=attention_mask,
@@ -169,7 +172,7 @@ class Flamingo(nn.Module):
             num_beams=num_beams,
             **kwargs,
         )
-
+        # print('Clearing conditioned layers')
         self.lang_encoder.clear_conditioned_layers()
         self.lang_encoder._use_cached_vision_x = False
         return output

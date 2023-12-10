@@ -127,7 +127,7 @@ def main():
         help="if True, we freeze the LM embeddings during training. Otherwise, we train the <image> and <|endofchunk|> embeddings.",
     )
     parser.add_argument(
-        "--logging_steps", type=int, default=100, help="log loss every n steps"
+        "--logging_steps", type=int, default=50, help="log loss every n steps"
     )
 
     # data args
@@ -239,7 +239,8 @@ def main():
     )
     parser.add_argument("--batch_size_mujoco", type=int, default=10)
     parser.add_argument("--model_cache_dir", type=str, default="/local/real/mandi/model_cache")
-
+    parser.add_argument("--save_every_epoch", type=int, default=2)
+    parser.add_argument("--is_val", action="store_true") # for validation dataset
     args = parser.parse_args()
 
     # Validate args
@@ -500,16 +501,15 @@ def main():
         lr_scheduler.load_state_dict(checkpoint["lr_scheduler_state_dict"])
 
     # Start training!
-    ddp_model.train()
- 
+    ddp_model.train() 
 
     for epoch in range(resume_from_epoch, args.num_epochs):
         mujoco_dataset.set_epoch(epoch)
         mujoco_loader = mujoco_dataset.dataloader
         
-        val_dataset.set_epoch(epoch)
-        mujoco_val_loader = val_dataset.dataloader
-
+        # val_dataset.set_epoch(epoch)
+        # mujoco_val_loader = val_dataset.dataloader
+        # ddp_model.eval()
         # validate_one_mujoco_epoch(
         #     args=args,
         #     model=ddp_model,
@@ -533,7 +533,8 @@ def main():
             device_id=device_id,
             wandb=wandb,
         )
-        save_checkpoint(ddp_model, optimizer, lr_scheduler, epoch, args)
+        if epoch % args.save_every_epoch == 0 or epoch == args.num_epochs - 1:
+            save_checkpoint(ddp_model, optimizer, lr_scheduler, epoch, args)
 
     # save final checkpoint
     save_checkpoint(ddp_model, optimizer, lr_scheduler, epoch, args)

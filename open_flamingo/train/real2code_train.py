@@ -1,4 +1,4 @@
-""" Main training script """
+""" Training script for real2code. """
 
 import argparse
 import glob
@@ -127,7 +127,7 @@ def main():
         help="if True, we freeze the LM embeddings during training. Otherwise, we train the <image> and <|endofchunk|> embeddings.",
     )
     parser.add_argument(
-        "--logging_steps", type=int, default=50, help="log loss every n steps"
+        "--logging_steps", type=int, default=20, help="log loss every n steps"
     )
 
     # data args
@@ -225,18 +225,22 @@ def main():
     parser.add_argument(
         "--mujoco_shards",
         type=str,
-        default="/local/real/mandi/mobility_shards/train/000000000.tar",
+        default="/local/real/mandi/mobility_shards_v2/train/0000.tar",
         help="path to mujoco shards, this should be a glob pattern such as /path/to/shards/shard-{0000..0999}.tar",
     )
     parser.add_argument(
         "--mujoco_val_shards",
         type=str,
-        default="/local/real/mandi/mobility_shards/val/000000000.tar",
+        default="/local/real/mandi/mobility_shards_v2/val/0000.tar",
         help="path to mujoco shards, this should be a glob pattern such as /path/to/shards/shard-{0000..0999}.tar",
     )
     parser.add_argument(
-        "--train_num_samples_mujoco", type=int, default=10000
+        "--train_num_samples_mujoco", type=int, default=1977
     )
+    parser.add_argument(
+        "--val_num_samples_mujoco", type=int, default=160
+    )
+    parser.add_argument("--no_vis_encoder", action="store_true")
     parser.add_argument("--batch_size_mujoco", type=int, default=10)
     parser.add_argument("--model_cache_dir", type=str, default="/local/real/mandi/model_cache")
     parser.add_argument("--save_every_epoch", type=int, default=2)
@@ -294,6 +298,7 @@ def main():
             wandb.init(
                 project=args.wandb_project,
                 entity=args.wandb_entity,
+                group="flamingo",
                 name=args.run_name,
                 config=vars(args),
             )
@@ -311,11 +316,10 @@ def main():
         gradient_checkpointing=args.gradient_checkpointing,
         freeze_lm_embeddings=args.freeze_lm_embeddings,
         cache_dir=args.model_cache_dir,
+        no_vis_encoder=args.no_vis_encoder,
     )
     random_seed(args.seed, args.rank)
-    print("Done creating models")
-    
-    
+    print("Done creating models") 
 
     # Load model checkpoint on CPU
     if os.path.exists(f"{args.run_name}") and args.resume_from_checkpoint is None:
@@ -342,7 +346,7 @@ def main():
         resume_from_epoch = checkpoint["epoch"] + 1
 
         # for fsdp, only one rank needs to load the state dict
-        if not args.fsdp or args.rank == 0:
+        if not args.fsdp or args.rank == 0: 
             model.load_state_dict(msd, False)
 
     # Initialize FSDP / DDP, and ensure the model is on GPU
@@ -465,11 +469,11 @@ def main():
     # total_training_steps = (
     #     (args.train_num_samples_mmc4) // (args.batch_size_mmc4 * args.world_size)
     # ) * args.num_epochs
-    print("Creating dataset")
+    print("Creating dataset") 
     mujoco_dataset = get_data(args, image_processor, tokenizer, "mujoco")
 
-    args.mujoco_shards = args.mujoco_val_shards
-    val_dataset = get_data(args, image_processor, tokenizer, "mujoco")
+    # args.mujoco_shards = args.mujoco_val_shards
+    val_dataset = get_data(args, image_processor, tokenizer, "mujoco", is_val=True)
 
     total_training_steps = (
         (args.train_num_samples_mujoco) // (args.batch_size_mujoco * args.world_size)
@@ -503,25 +507,25 @@ def main():
     # Start training!
     ddp_model.train() 
 
-    for epoch in range(resume_from_epoch, args.num_epochs):
+    for epoch in range(resume_from_epoch, resume_from_epoch + args.num_epochs):
         mujoco_dataset.set_epoch(epoch)
         mujoco_loader = mujoco_dataset.dataloader
         
-        # val_dataset.set_epoch(epoch)
-        # mujoco_val_loader = val_dataset.dataloader
+        val_dataset.set_epoch(epoch)
+        mujoco_val_loader = val_dataset.dataloader
         # ddp_model.eval()
-        # validate_one_mujoco_epoch(
-        #     args=args,
-        #     model=ddp_model,
-        #     epoch=epoch,
-        #     tokenizer=tokenizer,
-        #     optimizer=optimizer,
-        #     lr_scheduler=lr_scheduler, 
-        #     val_loader=mujoco_val_loader,
-        #     device_id=device_id,
-        #     wandb=wandb,
-        # )
-        # ddp_model.train()
+        log_dict = validate_one_mujoco_epoch(
+            args=args,
+            model=ddp_model,
+            epoch=epoch,
+            tokenizer=tokenizer,
+            optimizer=optimizer,
+            lr_scheduler=lr_scheduler, 
+            val_loader=mujoco_val_loader,
+            device_id=device_id,
+            wandb=wandb,
+        )
+        ddp_model.train()
         train_one_mujoco_epoch(
             args=args,
             model=ddp_model,
@@ -532,6 +536,7 @@ def main():
             mujoco_loader=mujoco_loader,
             device_id=device_id,
             wandb=wandb,
+            val_log_dict=log_dict,
         )
         if epoch % args.save_every_epoch == 0 or epoch == args.num_epochs - 1:
             save_checkpoint(ddp_model, optimizer, lr_scheduler, epoch, args)

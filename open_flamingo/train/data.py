@@ -32,7 +32,7 @@ except ImportError:
     hvd = None
 
 
-def preprocess_image(sample, image_processor):
+def preprocess_image(sample, image_processor, rand_flip=True):
     """
     Convert images to tensors for training.
     Augmentations: random horizontal flip.
@@ -42,7 +42,8 @@ def preprocess_image(sample, image_processor):
         image_processor = torchvision.transforms.ToTensor()
     image = [image_processor(s).unsqueeze(0) for s in sample]
     image = torch.cat(image, dim=0)
-    image = torchvision.transforms.RandomHorizontalFlip(p=0.5)(image)
+    if rand_flip:
+        image = torchvision.transforms.RandomHorizontalFlip(p=0.5)(image)
     return image
 
 
@@ -77,6 +78,13 @@ def preprocess_mujoco_text(sample, tokenizer, max_tokens=1024, is_val=False):
     if tokenizer is None:
         return torch.tensor([0]), torch.tensor([0])
     tokenizer.padding_side = "right"
+    for redunt in [
+        "model.compiler.autolimits = 'true'\n",
+        "model.compiler.meshdir = 'blender_meshes'\n",
+        "model.compiler.angle = 'radian'\n",
+    ]:
+        sample = [s.replace(redunt, "") for s in sample] 
+    
     if not is_val:
         sample = [
             (f"{s.strip()}<|endofchunk|>{tokenizer.eos_token}") for s in sample
@@ -96,7 +104,7 @@ def preprocess_mujoco_text(sample, tokenizer, max_tokens=1024, is_val=False):
         ] 
         text = tokenizer(
             sample,
-            max_length=1024,
+            max_length=max_tokens,
             padding="longest",
             # padding="max_length",
             return_tensors="pt",
@@ -504,24 +512,28 @@ def get_laion_dataset(args, image_processor, tokenizer, epoch=0, floor=False):
 
     return DataInfo(dataloader=dataloader, shared_epoch=shared_epoch)
 
-def get_mujoco_dataset(args, image_processor, tokenizer, epoch=0, floor=False):
+def get_mujoco_dataset(args, image_processor, tokenizer, epoch=0, floor=False, is_val=False):
     """
     Initialize webdataset for MuJoCo sim2real data
     Instead of downloading from web url, assume the data is saved locally
     """
     
-    input_shards = args.mujoco_shards
+    input_shards = args.mujoco_shards 
+    if is_val:
+        input_shards = args.mujoco_val_shards
     assert input_shards is not None
     resampled = getattr(args, "dataset_resampled", False)
 
     num_samples, num_shards = get_dataset_size(input_shards)
     if not num_samples:
         num_samples = args.train_num_samples_mujoco
+        if is_val:
+            num_samples = args.val_num_samples_mujoco
         if not num_samples:
             raise RuntimeError(
                 "Currently, number of dataset samples must be specified for training dataset. "
                 "Please specify via `--train-num-samples` if no dataset length info present."
-            )
+            ) 
 
     # create a shared epoch store to sync epoch to dataloader worker proc
     shared_epoch = SharedEpoch(epoch=epoch)
@@ -532,45 +544,64 @@ def get_mujoco_dataset(args, image_processor, tokenizer, epoch=0, floor=False):
     else:
         pipeline = [wds.SimpleShardList(input_shards)]
 
-    def process_mujoco_images_and_text(inp, num_cameras=1, num_joints=3):
-        """ sample seg images"""
+    def process_mujoco_images_and_text(inp, num_cameras=1, num_joints=1):
+        """ sample RGB images""" 
         inp = inp[0] 
-        image_names = inp["images"].keys()
-        
-        np_random = np.random.RandomState(
-            args.seed
-        )
+        if type(inp) == str:
+            inp = json.loads(inp)
+        image_names = inp["images"].keys()  
+        np_random = np.random.RandomState(args.seed)
         sampled_joint = np_random.choice(range(num_joints))
-        image_names = [name for name in image_names if "seg" in name and f"joint_{sampled_joint}" in name]
+        # image_names = [name for name in image_names if "seg" in name and f"joint_{sampled_joint}" in name]
+        image_names = [name for name in image_names if "rgb" in name]
+        # # remove all the side-view images!!
+        # image_names = [name for name in image_names if ("0" not in name and "7" not in name)]
+
         sampled_idxs = np_random.choice(len(image_names), num_cameras, replace=False)
         sampled_names = [image_names[i] for i in sampled_idxs]
-        images = []
-        for k in sampled_names:
-            base_str = inp["images"][k]
-            rawbytes = base64.b64decode(base_str)
-            image = Image.open(io.BytesIO(rawbytes)).convert("RGB")
-            images.append(image)
+        images = [] 
+        if args.no_vis_encoder:
+            # load the saved npz file
+            for k in sampled_names:
+                npz_path = inp["images"][k] 
+                emb_arr = np.load(npz_path)["emb"]
+                images.append(emb_arr)
+            images = np.array(images)
+        else:
+            for k in sampled_names:
+                base_str = inp["images"][k]
+                rawbytes = base64.b64decode(base_str)
+                image = Image.open(io.BytesIO(rawbytes)).convert("RGB") 
+                images.append(image) 
         
         # make the <image> token match the number of images
         inp["text"] = inp["text"].split("<image>")[0] + "<image>" * len(images) + inp["text"].split("<image>")[-1]
-        if args.is_val: 
-            break_str = "model = mjcf.RootElement(model='object')"
-            raw_text = inp["text"]
+        raw_text = inp["text"]
+        meta_data = dict(
+            text=raw_text,
+            obj_type=inp.get("obj_type", "unknown"),
+            obj_folder=inp.get("obj_folder", "unknown"),
+            obj_dir=inp.get("obj_dir", "unknown"),
+            image_names=sampled_names, # this excludes the full folder path
+        )
+        if is_val: 
+            # break_str = "model = mjcf.RootElement(model='object')"
+            break_str = "body_root = model.worldbody.add('body', name='root')\n"
             inp["text"] = inp["text"].split(break_str)[0] + "\n" + break_str
-            
-        
-        images = preprocess_image(images, image_processor)
+             
+        if args.no_vis_encoder:
+            images = torch.tensor(images).unsqueeze(0)
+        else:
+            images = preprocess_image(images, image_processor, rand_flip=False)
         ids, mask = preprocess_mujoco_text(
             [inp["text"]], 
             tokenizer,
-            is_val=args.is_val,
-            )
+            is_val=is_val,
+            ) 
         ids = ids.squeeze(0)
         mask = mask.squeeze(0)
-        if args.is_val: 
-            return images, ids, mask, raw_text
-        else:
-            return images, ids, mask
+        
+        return images, ids, mask, meta_data
 
     # at this point we have an iterator over all the shards
     if not resampled:
@@ -598,10 +629,14 @@ def get_mujoco_dataset(args, image_processor, tokenizer, epoch=0, floor=False):
         ]
     )
 
+    if True: #not args.no_vis_encoder:
+        pipeline.extend(
+            [wds.decode("pilrgb", handler=log_and_continue)]
+        )
+
     pipeline.extend(
         [
-            # wds.select(filter_no_caption_or_no_image),
-            wds.decode("pilrgb", handler=log_and_continue),
+            # wds.select(filter_no_caption_or_no_image), 
             wds.to_tuple("json"),
             wds.map(process_mujoco_images_and_text), 
             wds.batched(args.batch_size_mujoco, partial=False), 
@@ -653,10 +688,11 @@ def get_dataset_fn(dataset_type):
         raise ValueError(f"Unsupported dataset type: {dataset_type}")
 
 
-def get_data(args, image_processor, tokenizer, dataset_type, epoch=0):
+def get_data(args, image_processor, tokenizer, dataset_type, epoch=0, is_val=False):
     """
     Interface for getting the webdatasets
     """
     return get_dataset_fn(dataset_type)(
-        args, image_processor=image_processor, epoch=epoch, tokenizer=tokenizer
+        args, image_processor=image_processor, epoch=epoch, tokenizer=tokenizer,
+        is_val=is_val
     )

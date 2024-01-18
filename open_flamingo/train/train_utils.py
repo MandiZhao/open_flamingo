@@ -289,6 +289,7 @@ def train_one_mujoco_epoch(
     lr_scheduler,
     device_id,
     wandb,
+    val_log_dict=dict(),
 ):
     num_batches_per_epoch = mujoco_loader.num_batches
     total_training_steps = num_batches_per_epoch * args.num_epochs
@@ -308,7 +309,7 @@ def train_one_mujoco_epoch(
     step_time_m = AverageMeter()
     data_time_m = AverageMeter()
     end = time.time()
-
+    grad_step = 0
     for num_steps, batch in tqdm(
         enumerate(mujoco_loader),
         disable=args.rank != 0,
@@ -319,9 +320,10 @@ def train_one_mujoco_epoch(
         global_step = num_steps + epoch * num_batches_per_epoch
 
         #### FORWARD PASS ####
-        print(f"==== Step {num_steps+1}/{num_batches_per_epoch} ====")
+        # print(f"==== Step {num_steps+1}/{num_batches_per_epoch} ====")
         images = batch[0].to(device_id, dtype=cast_dtype, non_blocking=True)
-        images = rearrange(images, "b (t f) c h w -> b t f c h w", f=1)
+        if not args.no_vis_encoder:
+            images = rearrange(images, "b (t f) c h w -> b t f c h w", f=1)
         input_ids = batch[1].to(device_id, dtype=cast_dtype, non_blocking=True)
         attention_mask = batch[2].to(
             device_id, dtype=cast_dtype, non_blocking=True
@@ -372,7 +374,7 @@ def train_one_mujoco_epoch(
         else:
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         
-        # step optimizer and log
+        # step optimizer and log 
         if (((num_steps + 1) % args.gradient_accumulation_steps) == 0) or (
             num_steps == num_batches_per_epoch - 1
         ):
@@ -383,9 +385,11 @@ def train_one_mujoco_epoch(
             # step time and reset end outside of rank 0
             step_time_m.update(time.time() - end)
             end = time.time()
+            grad_step += 1
 
             # rank 0 logging
-            if args.rank == 0 and args.report_to_wandb and (num_steps + 1) % args.logging_steps == 0:
+            # if args.rank == 0 and args.report_to_wandb and (num_steps + 1) % args.logging_steps == 0:
+            if args.rank == 0 and args.report_to_wandb :
                 samples_per_second = (
                     args.gradient_accumulation_steps
                     * args.batch_size_mujoco
@@ -422,7 +426,7 @@ def train_one_mujoco_epoch(
         if ((num_steps + 1) % args.logging_steps == 0) and args.rank == 0:
             print(
                 f"Step {num_steps+1}/{num_batches_per_epoch} of epoch {epoch+1}/{args.num_epochs} complete. Loss: {loss.item():.3f}"
-            )
+            ) 
 
 def validate_one_mujoco_epoch(
     args,
@@ -439,10 +443,8 @@ def validate_one_mujoco_epoch(
     autocast = get_autocast(
         args.precision, cache_enabled=(not args.fsdp)
     )  # if fsdp, disable cache to save memory
-    cast_dtype = get_cast_dtype(args.precision)
-
-    
-    model.eval()
+    cast_dtype = get_cast_dtype(args.precision) 
+    # model.eval()
     with torch.inference_mode():
         media_token_id = tokenizer("<image>", add_special_tokens=False)["input_ids"][-1]
         endofchunk_token_id = tokenizer("<|endofchunk|>", add_special_tokens=False)[
@@ -463,9 +465,10 @@ def validate_one_mujoco_epoch(
         data_time_m.update(time.time() - end)
         global_step = num_steps + epoch * num_batches_per_epoch
         
-        with torch.inference_mode():
+        with torch.no_grad():
             images = batch[0].to(device_id, dtype=cast_dtype, non_blocking=True)
-            images = rearrange(images, "b (t f) c h w -> b t f c h w", f=1)
+            if not args.no_vis_encoder:
+                images = rearrange(images, "b (t f) c h w -> b t f c h w", f=1)
             input_ids = batch[1].to(device_id, dtype=cast_dtype, non_blocking=True)
             attention_mask = batch[2].to(
                 device_id, dtype=cast_dtype, non_blocking=True
@@ -477,15 +480,17 @@ def validate_one_mujoco_epoch(
             labels[labels == media_token_id] = -100
             labels = labels.to(device_id)
             labels.detach()
+
+            images.detach()
             # gradient accumulation w/ fsdp cpu offloading requires a no_sync context manager
-            with torch.no_grad(): 
-                with autocast(): 
-                    loss = model(
-                        vision_x=images,
-                        lang_x=input_ids,
-                        attention_mask=attention_mask,
-                        labels=labels,
-                    )[0]
+            # with torch.no_grad(): 
+            with autocast(): 
+                loss = model(
+                    vision_x=images,
+                    lang_x=input_ids,
+                    attention_mask=attention_mask,
+                    labels=labels,
+                )[0]
 
             total_val_loss += loss.item()
             total_val_steps += 1
@@ -495,22 +500,25 @@ def validate_one_mujoco_epoch(
         end = time.time()
         step_time_m.reset()
         data_time_m.reset()
-
-        
+    log_dict = dict()
     # rank 0 logging
-    if args.rank == 0 and args.report_to_wandb: 
-        wandb.log(
-            {
-                "val/data_time": data_time_m.avg,
-                "val/step_time": step_time_m.avg,
-                "val/loss": total_val_loss / total_val_steps,
-                "val/globle_stop": global_step,
-            },
-            commit=True,
-        ) 
-    model.train()
-    print('Done validating', f"Validation  Loss: {loss.item():.3f}")
-    return 
+    if args.rank == 0:
+        log_dict = {
+            "val/data_time": data_time_m.avg,
+            "val/step_time": step_time_m.avg,
+            "val/loss": total_val_loss / total_val_steps,
+            "val/globle_step": global_step,
+            "val/epoch": epoch,
+        }
+        print(f'Done validating Epoch {epoch}', f"Validation  Loss: {log_dict['val/loss']:.3f}")
+        if args.report_to_wandb: 
+            wandb.log(
+                log_dict,
+                commit=True,
+            ) 
+    # model.train()
+        
+    return log_dict
 
 
 

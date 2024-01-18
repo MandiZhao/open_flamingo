@@ -29,7 +29,7 @@ export WDS_CACHE=/local/real/mandi/model_cache
 torchrun --nnodes=1 --nproc_per_node=${WORLD_SIZE} real2code_eval.py --checkpoint_path /home/mandi/flg_share/test-Codellama-12Layer/checkpoint_4.pt
 """
 
-def load_model(checkpoint_path):
+def load_model(args, checkpoint_path):
     if not os.path.exists(checkpoint_path):
         raise ValueError(f"Checkpoint path {checkpoint_path} does not exist.")
     arg_path = os.path.join(os.path.dirname(checkpoint_path), "args.json")
@@ -45,6 +45,7 @@ def load_model(checkpoint_path):
             # device=-1, put on cpu first 
             cache_dir="/local/real/mandi/model_cache",
             checkpoint_path=checkpoint_path,
+            no_vis_encoder=args.no_vis_encoder,
             )
     else:
         with open(arg_path, "r") as f:
@@ -68,10 +69,13 @@ def main(args, output_dir):
     # set up distributed evaluation
     args.local_rank, args.rank, args.world_size = world_info_from_env()
     device_id = init_distributed_device(args)
+
+    # eval_model.init_distributed() skip this since using fsdp
+    
     if args.rank == 0:
         print(f"Running on {args.world_size} GPUs. Loading Checkpoint") 
     
-    eval_model = load_model(args.checkpoint_path)
+    eval_model = load_model(args, args.checkpoint_path)
     mp_policy = None
     args.my_group = None  # for optimizer saving
     process_group = None  # for FSDP init
@@ -95,24 +99,28 @@ def main(args, output_dir):
     eval_model.model.wrap_fsdp(wrapper_kwargs, device_id)
     tokenizer = eval_model.tokenizer
     image_processor = eval_model.image_processor
-    # eval_model.init_distributed() skip this since using fsdp
+    
     print('Loading dataset')
     dataset_args = dict(
-        mujoco_shards="/local/real/mandi/mobility_shards/val/000000000.tar",
+        mujoco_shards=args.eval_shard,
         dataset_resampled=1,
-        train_num_samples_mujoco=51,
+        train_num_samples_mujoco=160,
         seed=42,
         batch_size_mujoco=1,
         workers=1,
+        is_val=True,
+        no_vis_encoder=args.no_vis_encoder,
     )
     for k, v in dataset_args.items():
         setattr(args, k, v)
     args.is_val = True # cut the input to be short
-    dataset = get_data(args, eval_model.image_processor, eval_model.tokenizer, "mujoco")
-    loader = dataset.dataloader
+    dataset = get_data(args, eval_model.image_processor, eval_model.tokenizer, "mujoco", is_val=True)
+    loader = dataset.dataloader 
+    
 
     cast_dtype = None
-    with torch.inference_mode():
+    # with torch.inference_mode():
+    with torch.no_grad():
         with eval_model.autocast():
             media_token_id = tokenizer("<image>", add_special_tokens=False)["input_ids"][-1] 
             eos_token_id = tokenizer.encode("<|endofchunk|>")[-1]
@@ -121,36 +129,63 @@ def main(args, output_dir):
         enumerate(loader),
         disable=(args.rank != 0), 
     ):
-        step_output_dir = os.path.join(output_dir, f"step_{step}")
-        os.makedirs(step_output_dir, exist_ok=True)
+        assert len(batch) == 4, "Batch should be (images, input_ids, attention_mask, meta_data)"
+        meta_data = batch[3][0] # on each rank, len(batch) == batch_size_mujoco
+        label_text = meta_data['text']
+        obj_type = meta_data['obj_type']
+        obj_folder = meta_data['obj_folder']
+        obj_dir = meta_data['obj_dir']
+        
+        step_output_dir = os.path.join(output_dir, obj_type, obj_folder)
+        if not os.path.exists(step_output_dir):
+            os.makedirs(step_output_dir)
+        else:
+            # skip if already generated
+            # print(f"Skipping {step_output_dir} since already generated")
+            continue
+        image_names = meta_data['image_names']
+        for img_name in image_names: # e.g. ['loop_0_rgb_8']
+            if 'rgb' not in img_name:
+                continue
+            loop_id = img_name.split('_')[1]
+            rgb_id = img_name.split('_')[-1] 
+            full_img_path = os.path.join(obj_dir, f"loop_{loop_id}", f"rgb_{rgb_id}.png")
+            if not os.path.exists(full_img_path):
+                print(f"Image {full_img_path} does not exist, skipping")
+                continue
+            img = Image.open(full_img_path)
+            # save to output dir
+            img.save(join(step_output_dir, f"{img_name}.png"))
 
-        print('Preparing Input')
-        images = batch[0].to(device_id, dtype=cast_dtype, non_blocking=True)
-        images = rearrange(images, "b (t f) c h w -> b t f c h w", f=1)
-        # save images
-        for t in range(images.shape[1]):
-            img = images[0, t, 0].cpu().numpy()
-            img = np.transpose(img, (1, 2, 0))
-            img = (img * 255).astype(np.uint8)
-            img = Image.fromarray(img)
-            img.save(os.path.join(step_output_dir, f"image_{t}.png"))
+        if args.no_vis_encoder:
+            images = batch[0].to(device_id)
+        else:
+            images = batch[0].to(device_id, dtype=cast_dtype, non_blocking=True)
+            images = rearrange(images, "b (t f) c h w -> b t f c h w", f=1)
+            # save images
+            for t in range(images.shape[1]):
+                img = images[0, t, 0].cpu().numpy()
+                img = np.transpose(img, (1, 2, 0))
+                img = (img * 255).astype(np.uint8)
+                img = Image.fromarray(img).convert("RGB")
+                img.save(os.path.join(step_output_dir, f"image_{t}.png"))
 
         input_ids = batch[1].to(device_id, dtype=cast_dtype, non_blocking=True)
         attention_mask = batch[2].to(
             device_id, dtype=cast_dtype, non_blocking=True
         ) 
-        label_text = batch[-1][0] # str
-        # save label to json
+        
+        # save label to json 
         with open(os.path.join(step_output_dir, "label.json"), "w") as f:
             json.dump(label_text, f)
 
-        with torch.inference_mode():
+        with open(os.path.join(step_output_dir, "meta.json"), "w") as f:
+            json.dump(meta_data, f)
+
+        # with torch.inference_mode():
+        with torch.no_grad():
             with eval_model.autocast(): 
-                decoded_input = tokenizer.batch_decode(
-                            input_ids, skip_special_tokens=False)
-                # if args.rank == 0:
-                #     print("Input:")
-                #     print(decoded_input)
+                decoded_input = tokenizer.batch_decode(input_ids, skip_special_tokens=False) 
                 # save decoded str to json
                 with open(os.path.join(step_output_dir, "input.json"), "w") as f:
                     json.dump(decoded_input, f)
@@ -168,94 +203,40 @@ def main(args, output_dir):
                         attention_mask=attention_mask,
                         labels=labels,
                     )[0]
-                print("Validation Loss:", np.mean(loss.item()))
+                labels.detach()
+                # if args.rank == 0:
+                #     print("Validation Loss:", np.mean(loss.item()))
                 # save loss to json
                 with open(os.path.join(step_output_dir, "loss.json"), "w") as f:
                     json.dump(np.mean(loss.item()), f)
-                if np.mean(loss.item()) > 10:
-                    print("Loss is too high, skipping generation")
-                    continue 
+                
+                # if np.mean(loss.item()) > 10:
+                #     print("Loss is too high, skipping generation")
+                #     continue 
                 
                 outputs = unwrap_model(eval_model.model).generate(
                     images,
                     input_ids,
                     attention_mask,
                     min_new_tokens=10,
-                    max_new_tokens=1024,
+                    max_new_tokens=512,
                     num_beams=3,
                     length_penalty=0.0,
                     eos_token_id=eos_token_id,
+                    temperature=0,
                 )
 
         outputs = outputs[:, len(input_ids[0]) :] 
-        predictions = eval_model.tokenizer.batch_decode(
-            outputs, skip_special_tokens=True)
-        if args.rank == 0:
-            print("Output:")
-            print(predictions[0])
+        predictions = eval_model.tokenizer.batch_decode(outputs, skip_special_tokens=True)
+        pred = predictions[0]
+        break_str = "body_root = model.worldbody.add('body', name='root')\n"
+        label = label_text.split(break_str)[1]
+        toprint = f"===== Input =====\n{decoded_input[0]}\n=====\n===== Output =====\n{pred}\n=====\n===== Label =====\n{label}\n=====\n"
+        print(f"Rank {args.rank}:\n{toprint}")
+
         # save predictions to json
         with open(os.path.join(step_output_dir, "predictions.json"), "w") as f:
-            json.dump(predictions[0], f)
-
-
-def execute_predictions(args, output_dir, log_wandb=False):
-    if log_wandb:
-        wandb.init(project="real2code", name=os.path.basename(output_dir))
-        table = wandb.Table(columns=["step", "input_text", "input_image", "loss", "output_text", "output_image"])
-    steps = [s for s in os.listdir(output_dir) if s.startswith('step_')]
-    for step in steps:
-        pred_img_name = join(output_dir, step, 'pred_img.jpg')
-        input_text = json.load(open(join(output_dir, step, 'input.json'), 'r'))
-        if isinstance(input_text, list):
-            input_text = input_text[0]
-        loss  = json.load(open(join(output_dir, step, 'loss.json'), 'r'))
-        input_img = join(output_dir, step, 'image_0.png')
-        input_img = wandb.Image(input_img)
-        
-        row = [int(step.split('_')[-1]), input_text, input_img, loss, "", None]
-        if os.path.exists(join(output_dir, step, 'predictions.json')):
-            preds = json.load(open(join(output_dir, step, 'predictions.json'), 'r'))
-            row[4] = preds
-            preds = preds.split("\n")
-            code_header = [
-                "from dm_control import mjcf",
-                "import mujoco",
-                "from PIL import Image",
-                "model = mjcf.RootElement(model='object')",
-                "model.compiler.autolimits = 'true'",
-                "model.compiler.angle = 'radian'",
-            ]
-            code_header.extend(preds)
-            code_header.extend([
-                "cam = model.worldbody.add('camera', name='camera', pos=[-2, 3, 3], mode='targetbody', target='object', fovy=30)",
-                "mjcf_physics = mjcf.Physics.from_mjcf_model(model)",
-                "low = mjcf_physics.model.jnt_range[:, 0]",
-                "high = mjcf_physics.model.jnt_range[:, 1]",
-                "import numpy as np",
-                "val = np.random.uniform(low=low, high=high)",
-                "mjcf_physics.data.qpos[:] = high",
-                "mjcf_physics.data.qvel[:] = 0",
-                "mjcf_physics.forward()",
-                "img = mjcf_physics.render(camera_id='camera', height=480, width=480, depth=False)",
-                "img = Image.fromarray(img)",
-                f"img.save('{pred_img_name}')",
-            ])
-            code_header = "\n".join(code_header)
-            # save as python file
-            with open(join(output_dir, step, 'pred.py'), 'w') as f:
-                f.write(code_header)
-            try:
-                exec(code_header)
-                print(f"Code executed. Saved {pred_img_name}")
-                output_img = wandb.Image(pred_img_name)
-                row[5] = output_img
-            except Exception as e:
-                print(f"Code execution failed: {e}")
-        if log_wandb:
-            table.add_data(*row)
-    if log_wandb:
-        wandb.log({"Outputs": table})
-    return 
+            json.dump(pred, f)
 
 
 if __name__ == "__main__":
@@ -263,6 +244,11 @@ if __name__ == "__main__":
     parser.add_argument("--model", type=str, default="open_flamingo")
     parser.add_argument("--checkpoint_path", type=str, default="/home/mandi/open_flamingo/open_flamingo/train/test-Codellama/checkpoint_25.pt")
     parser.add_argument("--eval_data_dir", type=str, default="/home/mandi/flg_share/eval_data")
+    parser.add_argument("--eval_shard", type=str, default="/local/real/mandi/mobility_shards_v2_emb/val/0000.tar")
+    parser.add_argument("--mujoco_val_shards", type=str, default="/local/real/mandi/mobility_shards_v2_loop_0_emb/val/0000.tar")
+    
+    parser.add_argument("--val_num_samples_mujoco", type=int, default=160)
+
     parser.add_argument("--horovod", action="store_true")
     parser.add_argument("--fsdp_sharding_strategy", type=str, default="full")
     parser.add_argument("--fsdp_use_orig_params", action="store_true")
@@ -274,15 +260,13 @@ if __name__ == "__main__":
     )
     parser.add_argument("--try_exec_pred", action="store_true")
     parser.add_argument("--wandb", action="store_true")
+    parser.add_argument("--no_vis_encoder", action="store_true")
+    parser.add_argument("--is_val", action="store_true", default=True)
     args = parser.parse_args()
     
     run_name = os.path.dirname(args.checkpoint_path).split('/')[-1] 
     ckpt_name = os.path.basename(args.checkpoint_path).split('.')[0]
     output_dir = join(args.eval_data_dir, run_name, ckpt_name)
-    
-    if args.try_exec_pred:
-        execute_predictions(args, output_dir, args.wandb)
-        exit()
-
+      
     main(args, output_dir)
 

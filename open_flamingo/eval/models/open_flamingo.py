@@ -5,7 +5,7 @@ import torch
 from einops import repeat
 
 from open_flamingo.eval.eval_model import BaseEvalModel
-from open_flamingo.src.factory import create_model_and_transforms
+from open_flamingo.src.factory import create_model_and_transforms, create_textlm_and_transforms
 from open_flamingo.eval.utils import unwrap_model, get_autocast, get_cast_dtype
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
@@ -36,18 +36,35 @@ class EvalModel(BaseEvalModel):
             else "cpu"
         )
         self.device = torch.device(self.device) if self.device == "cpu" else torch.device(f"cuda:{self.device}")
-        (
-            self.model,
-            self.image_processor,
-            self.tokenizer,
-        ) = create_model_and_transforms(
-            model_args["vision_encoder_path"],
-            model_args["vision_encoder_pretrained"],
-            model_args["lm_path"],
-            model_args["lm_tokenizer_path"],
-            cross_attn_every_n_layers=int(model_args["cross_attn_every_n_layers"]),
-            cache_dir=model_args.get('cache_dir', None),
-        )
+        if model_args.get('text_lm', False):
+            (
+                self.model,
+                self.image_processor, # None here
+                self.tokenizer,
+            ) = create_textlm_and_transforms(
+                model_args["lm_path"],
+                model_args["lm_tokenizer_path"],
+                cache_dir=model_args.get('cache_dir', None),
+                use_lora=model_args.get('use_lora', False),
+                finetune_every_n_layers=model_args.get('finetune_every_n_layers', 0),
+                lora_alpha=model_args.get('lora_alpha', 32),
+                lora_r=model_args.get('lora_r', 8),
+
+            )
+        else:
+            (
+                self.model,
+                self.image_processor,
+                self.tokenizer,
+            ) = create_model_and_transforms(
+                model_args["vision_encoder_path"],
+                model_args["vision_encoder_pretrained"],
+                model_args["lm_path"],
+                model_args["lm_tokenizer_path"],
+                cross_attn_every_n_layers=int(model_args["cross_attn_every_n_layers"]),
+                cache_dir=model_args.get('cache_dir', None),
+                no_vis_encoder=model_args.get('no_vis_encoder', False),
+            )
         if model_args.get("checkpoint_path", None):
             checkpoint = torch.load(model_args["checkpoint_path"], map_location=self.device)
             if "model_state_dict" in checkpoint:
@@ -59,7 +76,7 @@ class EvalModel(BaseEvalModel):
         self.tokenizer.padding_side = "left"
 
         self.lm_name = model_args["lm_path"].split("/")[-1]
-
+        self.model_args = model_args
         # autocast
         self.autocast = get_autocast(model_args["precision"])
         self.cast_dtype = get_cast_dtype(model_args["precision"])
@@ -74,6 +91,9 @@ class EvalModel(BaseEvalModel):
                 shape (B, T_img, F, C, H, W)
                 None if no images in batch
         """
+        if self.image_processor is None:
+            assert self.model_args.get('text_lm', False), "Image processor is None, but model is not a text language model"
+            return None
         images_per_example = max(len(x) for x in batch)
         batch_images = None
         for iexample, example in enumerate(batch):

@@ -24,6 +24,8 @@ class Flamingo(nn.Module):
         vis_dim: int,
         cross_attn_every_n_layers: int = 1,
         gradient_checkpointing: bool = False,
+        no_vis_encoder: bool = False,
+        no_vision: bool = False,
     ):
         """
         Args:
@@ -34,6 +36,7 @@ class Flamingo(nn.Module):
             vis_dim (int): Dimension of the visual features.
                 Visual features are projected to match this shape along the last dimension.
             cross_attn_every_n_layers (int, optional): How often to apply cross attention after transformer layer. Defaults to 1.
+            no_vis_encoder (bool, optional): If true, do not use vision encoder. Defaults to False.
         """
         super().__init__()
         self.eoc_token_id = eoc_token_id
@@ -43,9 +46,16 @@ class Flamingo(nn.Module):
             self.lang_dim = lang_encoder.config.d_model  # mpt uses d_model
         else:
             self.lang_dim = lang_encoder.config.hidden_size
-
-        self.vision_encoder = vision_encoder.visual
-        self.perceiver = PerceiverResampler(dim=self.vis_dim)
+        self.no_vis_encoder = no_vis_encoder
+        self.vision_encoder = None 
+        if not self.no_vis_encoder and not no_vision:
+            self.vision_encoder = vision_encoder.visual
+        self.no_vision = no_vision
+        if self.no_vision:
+            self.perceiver = nn.Module()
+        else:
+            self.perceiver = PerceiverResampler(dim=self.vis_dim)
+            self.perceiver._use_gradient_checkpointing = gradient_checkpointing
         self.lang_encoder = lang_encoder
         self.lang_encoder.init_flamingo(
             media_token_id=media_token_id,
@@ -55,7 +65,7 @@ class Flamingo(nn.Module):
             gradient_checkpointing=gradient_checkpointing,
         )
         self._use_gradient_checkpointing = gradient_checkpointing
-        self.perceiver._use_gradient_checkpointing = gradient_checkpointing
+        
 
     def forward(
         self,
@@ -95,7 +105,7 @@ class Flamingo(nn.Module):
             self.lang_encoder._use_cached_vision_x or vision_x is not None
         ), "Must provide either vision_x or have precached media using cache_media()."
 
-        if self.lang_encoder._use_cached_vision_x:
+        if self.lang_encoder._use_cached_vision_x and not self.no_vision:
             # Case: use cached; vision_x should be cached and other
             # vision-related inputs should not be provided.
             assert (
@@ -104,7 +114,7 @@ class Flamingo(nn.Module):
             assert self.lang_encoder.is_conditioned()
 
         else:
-            # Case: do not use caching (i.e. this is a standard forward pass);
+            # Case: do not use caching (i.e. this is a standard forward pass); 
             self._encode_vision_x(vision_x=vision_x)
             self._condition_media_locations(input_ids=lang_x)
         
@@ -155,13 +165,13 @@ class Flamingo(nn.Module):
             torch.Tensor: lang_x with generated tokens appended to it
         """
         # print("Input shapes", vision_x.shape, lang_x.shape)
-        num_beams = kwargs.pop("num_beams", 1)
+        num_beams = kwargs.pop("num_beams", 1) 
         if num_beams > 1:
             vision_x = vision_x.repeat_interleave(num_beams, dim=0)
 
         self.lang_encoder._use_cached_vision_x = True
         # print('Encoding vision X')
-        self._encode_vision_x(vision_x=vision_x)
+        self._encode_vision_x(vision_x=vision_x) 
 
         eos_token_id = kwargs.pop("eos_token_id", self.eoc_token_id)
         # print('Lang encoder generate')
@@ -188,15 +198,24 @@ class Flamingo(nn.Module):
 
         rearrange code based on https://github.com/dhansmair/flamingo-mini
         """
+        if self.no_vision:
+            # condition on empty tensor
+            dummy = torch.zeros((1, 1, 64, 1024)).to(vision_x.device)
+            for layer in self.lang_encoder._get_decoder_layers():
+                layer.condition_vis_x(dummy)
+            return
+        if not self.no_vis_encoder:
+            assert vision_x.ndim == 6, "vision_x should be of shape (b, T_img, F, C, H, W)"
+            b, T, F = vision_x.shape[:3]
+            assert F == 1, "Only single frame supported"
 
-        assert vision_x.ndim == 6, "vision_x should be of shape (b, T_img, F, C, H, W)"
-        b, T, F = vision_x.shape[:3]
-        assert F == 1, "Only single frame supported"
-
-        vision_x = rearrange(vision_x, "b T F c h w -> (b T F) c h w")
-        with torch.no_grad():
-            vision_x = self.vision_encoder(vision_x)[1]
-        vision_x = rearrange(vision_x, "(b T F) v d -> b T F v d", b=b, T=T, F=F)
+            vision_x = rearrange(vision_x, "b T F c h w -> (b T F) c h w")
+            with torch.no_grad():
+                vision_x = self.vision_encoder(vision_x)[1]
+            vision_x = rearrange(vision_x, "(b T F) v d -> b T F v d", b=b, T=T, F=F)
+        else:
+            assert vision_x.ndim == 5, "vision_x should be of shape (b, T_img, F, v d)"
+        
         vision_x = self.perceiver(vision_x)
 
         for layer in self.lang_encoder._get_decoder_layers():
@@ -277,7 +296,8 @@ class Flamingo(nn.Module):
             self.lang_encoder.set_output_embeddings(
                 wrap(wrap(self.lang_encoder.get_output_embeddings()))
             )
-            self.vision_encoder = wrap(wrap(self.vision_encoder))  # frozen
+            if not self.no_vis_encoder and not self.no_vision:
+                self.vision_encoder = wrap(wrap(self.vision_encoder))  # frozen
 
         # manually move non-FSDP managed parameters to device_id
         # these are all in lang_encoder
@@ -329,7 +349,8 @@ class Flamingo(nn.Module):
                 Images in the same chunk are collated along T_img, and frames are collated along F
                 Currently only F=1 is supported (single-frame videos)
         """
-        self._encode_vision_x(vision_x=vision_x)
+        if not self.no_vision:
+            self._encode_vision_x(vision_x=vision_x)
         self._condition_media_locations(input_ids=input_ids)
         self.lang_encoder._use_cached_vision_x = True
 

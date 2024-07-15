@@ -16,7 +16,10 @@ from PIL import Image
 import base64
 from scipy.optimize import linear_sum_assignment
 from data_utils import *
-
+from torchvision.transforms.functional import crop as tvf_crop
+from torchvision.transforms.functional import resize as tvf_resize
+from torchvision.transforms import Compose, ColorJitter, ToTensor, Normalize, RandomCrop, RandomHorizontalFlip, CenterCrop
+from copy import deepcopy 
 
 Image.MAX_IMAGE_PIXELS = 1000000000
 N_CHANNELS = 3
@@ -32,20 +35,71 @@ except ImportError:
     hvd = None
 
 
-def preprocess_image(sample, image_processor, rand_flip=True):
+def preprocess_image(sample, image_processor, rand_flip=True, color_jitter=False, rand_crop=False, original_size=(512, 512)):
     """
     Convert images to tensors for training.
     Augmentations: random horizontal flip.
     Normalization handled by wds.
+
+    image_processor.transforms: [
+        Resize(size=224, interpolation=bicubic, max_size=None, antialias=warn), 
+        CenterCrop(size=(224, 224)), 
+        <function _convert_to_rgb at 0x7f34603a0160>, 
+        ToTensor(),
+        Normalize(mean=(0.48145466, 0.4578275, 0.40821073), std=(0.26862954, 0.26130258, 0.27577711))
+        ]
     """
     if image_processor is None:
-        image_processor = torchvision.transforms.ToTensor()
+        transforms = [ToTensor()]
+    else:
+        transforms = image_processor.transforms
+    if rand_crop: 
+        rand_crop = RandomCrop(420) # hard code
+        transforms = [rand_crop] + transforms
+    else:
+        # center crop
+        transforms = [CenterCrop(420)] + transforms
+    if rand_flip:
+        transforms.insert(2, RandomHorizontalFlip(p=0.5))
+    if color_jitter:
+        transforms.insert(1, ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.1))
+    
+    image_processor = Compose(transforms)
     image = [image_processor(s).unsqueeze(0) for s in sample]
     image = torch.cat(image, dim=0)
-    if rand_flip:
-        image = torchvision.transforms.RandomHorizontalFlip(p=0.5)(image)
+    
     return image
 
+def reformat_text(input_text):
+    short = []
+    for line in input_text.split("\n"):
+        if "asset.add" in line or "import" in line:
+            continue 
+        short.append(line)
+    short = "\n".join(short)
+    # split by block
+    short = short.split("\n\n")
+    joint_adjusted = []
+    keywords = ["_idx", "_edge", "_sign", "compute_joint_from_obb"]
+    for block in short: 
+        if all([keyword in block for keyword in keywords]):
+            adjusted_block = deepcopy(block)
+            _idx = block.split("_idx = ")[1].split("\n")[0]
+            _edge = block.split("_edge = ")[1].split("\n")[0]
+            _sign = block.split("_sign = ")[1].split("\n")[0] 
+            joint_line = [line for line in block.split("\n") if "compute_joint_from_obb" in line][0]
+            _box_name = joint_line.split("sign, ")[1].split(")")[0]
+            new_line = joint_line.split("compute_joint_from_obb(")[0]
+            new_line += f"compute_joint_from_obb({_edge}, {_idx}, {_sign}, {_box_name})"
+            
+            adjusted_block = adjusted_block.replace(joint_line, new_line)
+            adjusted_block = "\n".join(
+                [line for line in adjusted_block.split("\n") if "_idx" not in line and "_edge" not in line and "_sign" not in line]
+            )
+            joint_adjusted.append(adjusted_block)
+        else:
+            joint_adjusted.append(block) 
+    return "\n\n".join(joint_adjusted)
 
 def filter_no_caption_or_no_image(sample):
     """
@@ -74,7 +128,12 @@ def preprocess_laion_text(sample, tokenizer, max_tokens=32):
     )
     return text["input_ids"], text["attention_mask"]
 
-def preprocess_mujoco_text(sample, tokenizer, max_tokens=1024, is_val=False):
+def preprocess_mujoco_text(
+        sample, tokenizer, max_tokens=1024, is_val=False, shorten=False, chunk_token="<|endofchunk|>"):
+    
+    """
+    New for datav3: all data is now less than 1645 tokens, no truncation needed 
+    """
     if tokenizer is None:
         return torch.tensor([0]), torch.tensor([0])
     tokenizer.padding_side = "right"
@@ -85,18 +144,21 @@ def preprocess_mujoco_text(sample, tokenizer, max_tokens=1024, is_val=False):
     ]:
         sample = [s.replace(redunt, "") for s in sample] 
     
+    if shorten:
+        raw_sample = deepcopy(sample)
+        sample = [reformat_text(s) for s in sample]
     if not is_val:
         sample = [
-            (f"{s.strip()}<|endofchunk|>{tokenizer.eos_token}") for s in sample
+            (f"{s.strip()}{tokenizer.eos_token}") for s in sample
         ] 
         text = tokenizer(
             sample,
-            max_length=max_tokens,
-            # padding="longest",
-            padding="max_length",
+            # max_length=max_tokens,
+            padding="longest", # latest v3 data should have 760 max tokens
+            # padding="max_length",
             return_tensors="pt",
             # truncation="only_first",
-            truncation=True,
+            # truncation=True,
         ) 
     else:
         sample = [
@@ -104,13 +166,15 @@ def preprocess_mujoco_text(sample, tokenizer, max_tokens=1024, is_val=False):
         ] 
         text = tokenizer(
             sample,
-            max_length=max_tokens,
+            # max_length=max_tokens,
             padding="longest",
             # padding="max_length",
             return_tensors="pt",
             # truncation="only_first",
-            truncation=True,
-        ) 
+            truncation=False,
+        )  
+    if shorten:
+        return text["input_ids"], text["attention_mask"], raw_sample
     return text["input_ids"], text["attention_mask"]
 
 
@@ -309,8 +373,7 @@ def preprocess_interleaved(
         images_tensors,
         (text_tensor["input_ids"], text_tensor["attention_mask"]),
     )
-
-
+ 
 def get_mmc4_dataset(args, image_processor, tokenizer, epoch=0, floor=False):
     """
     Initialize webdataset for MMC4 / ChatGPT sequences
@@ -512,7 +575,7 @@ def get_laion_dataset(args, image_processor, tokenizer, epoch=0, floor=False):
 
     return DataInfo(dataloader=dataloader, shared_epoch=shared_epoch)
 
-def get_mujoco_dataset(args, image_processor, tokenizer, epoch=0, floor=False, is_val=False):
+def get_mujoco_dataset(args, image_processor, tokenizer, epoch=0, floor=False, is_val=False, is_test=False):
     """
     Initialize webdataset for MuJoCo sim2real data
     Instead of downloading from web url, assume the data is saved locally
@@ -556,9 +619,11 @@ def get_mujoco_dataset(args, image_processor, tokenizer, epoch=0, floor=False, i
         image_names = [name for name in image_names if "rgb" in name]
         # # remove all the side-view images!!
         # image_names = [name for name in image_names if ("0" not in name and "7" not in name)]
-
-        sampled_idxs = np_random.choice(len(image_names), num_cameras, replace=False)
-        sampled_names = [image_names[i] for i in sampled_idxs]
+        if len(image_names) == 0:
+            sampled_names =[]
+        else:
+            sampled_idxs = np_random.choice(len(image_names), num_cameras, replace=False)
+            sampled_names = [image_names[i] for i in sampled_idxs]
         images = [] 
         if args.no_vis_encoder:
             # load the saved npz file
@@ -567,15 +632,23 @@ def get_mujoco_dataset(args, image_processor, tokenizer, epoch=0, floor=False, i
                 emb_arr = np.load(npz_path)["emb"]
                 images.append(emb_arr)
             images = np.array(images)
+        elif args.no_vision or args.text_lm:
+            images = torch.zeros(1, 3, 224, 224)
         else:
             for k in sampled_names:
                 base_str = inp["images"][k]
                 rawbytes = base64.b64decode(base_str)
                 image = Image.open(io.BytesIO(rawbytes)).convert("RGB") 
                 images.append(image) 
-        
+        # print("Loaded from inp === ", inp["text"] + "\n"*3)
         # make the <image> token match the number of images
-        inp["text"] = inp["text"].split("<image>")[0] + "<image>" * len(images) + inp["text"].split("<image>")[-1]
+        if len(sampled_names) > 0: 
+            if args.no_vision:
+                inp["text"] = inp["text"].split("<image>")[0] + inp["text"].split("<image>")[-1]
+            elif args.text_lm:
+                inp["text"] = inp["text"].split("<image>")[0] + inp["text"].split("<image>")[-1]
+            else:
+                inp["text"] = inp["text"].split("<image>")[0] + "<image>" * len(images) + inp["text"].split("<image>")[-1]
         raw_text = inp["text"]
         meta_data = dict(
             text=raw_text,
@@ -584,20 +657,39 @@ def get_mujoco_dataset(args, image_processor, tokenizer, epoch=0, floor=False, i
             obj_dir=inp.get("obj_dir", "unknown"),
             image_names=sampled_names, # this excludes the full folder path
         )
-        if is_val: 
-            # break_str = "model = mjcf.RootElement(model='object')"
-            break_str = "body_root = model.worldbody.add('body', name='root')\n"
+        break_str = "body_root = model.worldbody.add('body', name='root')\n"
+        # print("Before breaking === \n", inp["text"] + "\n"*3)
+        if is_test:
+            if 'root_geom = ' in inp["text"]:
+                break_str = "root_geom = "
             inp["text"] = inp["text"].split(break_str)[0] + "\n" + break_str
-             
+        # print("After breaking ===\n", inp["text"] + "\n"*3, args.shorten_text) 
         if args.no_vis_encoder:
             images = torch.tensor(images).unsqueeze(0)
+        elif (not args.no_vision and not args.text_lm):
+            if args.use_aug and not is_val:
+                images = preprocess_image(images, image_processor, rand_flip=False, color_jitter=True, rand_crop=True)
+            else:
+                images = preprocess_image(images, image_processor)
+        if args.shorten_text:
+            ids, mask, before_shorten = preprocess_mujoco_text(
+                [inp["text"]], 
+                tokenizer,
+                is_val=is_val,
+                max_tokens=args.max_tokens_mujoco,
+                shorten=args.shorten_text,
+                chunk_token=("" if args.text_lm else "<|endofchunk|>"),
+                )
+            meta_data["before_shorten"] = before_shorten
         else:
-            images = preprocess_image(images, image_processor, rand_flip=False)
-        ids, mask = preprocess_mujoco_text(
-            [inp["text"]], 
-            tokenizer,
-            is_val=is_val,
-            ) 
+            ids, mask = preprocess_mujoco_text(
+                [inp["text"]], 
+                tokenizer,
+                is_val=is_val,
+                max_tokens=args.max_tokens_mujoco,
+                shorten=args.shorten_text,
+                chunk_token=("" if args.text_lm else "<|endofchunk|>"),
+                ) 
         ids = ids.squeeze(0)
         mask = mask.squeeze(0)
         
@@ -688,11 +780,11 @@ def get_dataset_fn(dataset_type):
         raise ValueError(f"Unsupported dataset type: {dataset_type}")
 
 
-def get_data(args, image_processor, tokenizer, dataset_type, epoch=0, is_val=False):
+def get_data(args, image_processor, tokenizer, dataset_type, epoch=0, is_val=False, is_test=False):
     """
     Interface for getting the webdatasets
     """
     return get_dataset_fn(dataset_type)(
         args, image_processor=image_processor, epoch=epoch, tokenizer=tokenizer,
-        is_val=is_val
+        is_val=is_val, is_test=is_test
     )

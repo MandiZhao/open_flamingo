@@ -21,7 +21,7 @@ from torch.distributed.fsdp import (
 from open_flamingo.eval.utils import unwrap_model, get_autocast, get_cast_dtype
 
 import functools
-from open_flamingo import create_model_and_transforms
+from open_flamingo import create_model_and_transforms, create_textlm_and_transforms
 import open_clip 
 import webdataset as wds
 import os
@@ -29,7 +29,7 @@ import io
 from PIL import Image
 import base64
 from transformers import SamModel, SamProcessor
-
+from copy import deepcopy
 """
 test fsdp:
  
@@ -67,31 +67,19 @@ def run(args):
     # test_model(args)
     # exit()
     image_processor, tokenizer = None, None
-    # model, image_processor, tokenizer = create_model_and_transforms(
-    #     "ViT-L-14",
-    #     "openai",
-    #     "/home/mandi/codellama/CodeLlama-7b",
-    #     "/home/mandi/codellama/CodeLlama-7b",
-    #     cross_attn_every_n_layers=16q,
-    #     use_local_files=True,
-    #     gradient_checkpointing=False,
-    #     freeze_lm_embeddings=True,
-    #     cache_dir="/local/real/mandi/model_cache",
-    # )
+    model, image_processor, tokenizer = create_model_and_transforms(
+        "ViT-L-14",
+        "openai",
+        "/home/mandi/codellama/CodeLlama-7b",
+        "/home/mandi/codellama/CodeLlama-7b",
+        cross_attn_every_n_layers=16,
+        use_local_files=True,
+        gradient_checkpointing=False,
+        freeze_lm_embeddings=True,
+        cache_dir="/local/real/mandi/model_cache",
+    )
     
-    def process_images_and_text(inp, np_seed=0, num_cameras=4):
-        # img1, img2, img3, img4, json = inp
-        # stacked = [img1, img2, img3, img4]
-        # images = preprocess_image(stacked, image_processor)
-        
-        # ids, mask = preprocess_mujoco_text(
-        #     [json["text"]], 
-        #     tokenizer)
-        # ids = ids.squeeze(0)
-        # mask = mask.squeeze(0) # squeeze from (batch_size, 1, seq_len)
-        # print(ids.shape, mask.shape)
-        # return images, ids, mask
-
+    def process_images_and_text(inp, np_max_tokens_mujocoseed=0, num_cameras=4):
         inp = inp[0] 
         image_names = inp["images"].keys()
         np_random = np.random.RandomState(np_seed)
@@ -163,6 +151,37 @@ def run(args):
             img.save(os.path.join(step_output_dir, f"image_{t}.png")) 
         # breakpoint()
 
+def reformat_text(input_text):
+    short = []
+    for line in input_text.split("\n"):
+        if "asset.add" in line or "import" in line:
+            continue 
+        short.append(line)
+    short = "\n".join(short)
+    # split by block
+    short = short.split("\n\n")
+    joint_adjusted = []
+    keywords = ["_idx", "_edge", "_sign", "compute_joint_from_obb"]
+    for block in short: 
+        if all([keyword in block for keyword in keywords]):
+            adjusted_block = deepcopy(block)
+            _idx = block.split("_idx = ")[1].split("\n")[0]
+            _edge = block.split("_edge = ")[1].split("\n")[0]
+            _sign = block.split("_sign = ")[1].split("\n")[0] 
+            joint_line = [line for line in block.split("\n") if "compute_joint_from_obb" in line][0]
+            _box_name = joint_line.split("sign, ")[1].split(")")[0]
+            new_line = joint_line.split("compute_joint_from_obb(")[0]
+            new_line += f"compute_joint_from_obb({_edge}, {_idx}, {_sign}, {_box_name})"
+            
+            adjusted_block = adjusted_block.replace(joint_line, new_line)
+            adjusted_block = "\n".join(
+                [line for line in adjusted_block.split("\n") if "_idx" not in line and "_edge" not in line and "_sign" not in line]
+            )
+            joint_adjusted.append(adjusted_block)
+        else:
+            joint_adjusted.append(block) 
+    return "\n\n".join(joint_adjusted)
+
 def examine_data(args):
     if args.test_fsdp:
         args.fsdp_use_orig_params = True 
@@ -171,18 +190,32 @@ def examine_data(args):
         device_id = init_distributed_device(args)
 
     image_processor, tokenizer = None, None
-    # model, image_processor, tokenizer = create_model_and_transforms(
-    #     "ViT-L-14",
-    #     "openai",
-    #     "/home/mandi/codellama/CodeLlama-7b",
-    #     "/home/mandi/codellama/CodeLlama-7b",
-    #     cross_attn_every_n_layers=16,
-    #     use_local_files=True,
-    #     gradient_checkpointing=False,
-    #     freeze_lm_embeddings=True,
-    #     cache_dir="/local/real/mandi/model_cache",
-    #     no_vis_encoder=args.no_vis_encoder,
-    # )
+    if args.load_model:
+        # text-only LLM
+        model, image_processor, tokenizer  = create_textlm_and_transforms(
+            "/home/mandi/codellama/CodeLlama-7b",
+            "/home/mandi/codellama/CodeLlama-7b",
+            finetune_every_n_layers=-1,
+            use_local_files=True,
+            gradient_checkpointing=False,
+            freeze_lm_embeddings=True,
+            cache_dir="/local/real/mandi/model_cache",
+        ) 
+        # model, image_processor, tokenizer = create_model_and_transforms(
+        #     "ViT-L-14",
+        #     "openai",
+        #     "/home/mandi/codellama/CodeLlama-7b",
+        #     "/home/mandi/codellama/CodeLlama-7b",
+        #     cross_attn_every_n_layers=16,
+        #     use_local_files=True,
+        #     gradient_checkpointing=False,
+        #     freeze_lm_embeddings=True,
+        #     cache_dir="/local/real/mandi/model_cache",
+        #     no_vis_encoder=args.no_vis_encoder,
+        #     no_vision=args.no_vision,
+        # )
+    # print(image_processor)
+   
     dataset_args = dict(
         fsdp_sharding_strategy="full",
         fsdp_use_orig_params=True,
@@ -192,19 +225,31 @@ def examine_data(args):
         seed=42,
         batch_size_mujoco=1,
         workers=1,
-        is_val=1,
+        is_val=args.is_val,
         no_vis_encoder=args.no_vis_encoder,
+        text_lm=args.text_lm,
     )
     for k, v in dataset_args.items():
         setattr(args, k, v)
-    dataset = get_data(args, image_processor, tokenizer, "mujoco", is_val=True)
+    dataset = get_data(args, image_processor, tokenizer, "mujoco", is_val=args.is_val)
     loader = dataset.dataloader
     if args.test_fsdp:
         print(f"Rank: {args.rank}, world_size: {args.world_size} | Loader num batches: {loader.num_batches}")
    
     output_dir = "test_output"
+    inp_lens = []
+    raw_lens = []
+    device_id = "cuda:0"
+    if not args.test_fsdp and args.load_model: 
+        model = model.to(device_id)
     for i, batch in enumerate(loader):
-        images = batch[0]
+        images = batch[0] #.to(device_id)
+        ids = batch[1]#.to(device_id)
+        masks = batch[2]#.to(device_id)
+        labels = ids.clone()
+        
+        labels = labels.to(device_id)
+        # loss = model(vision_x=images,lang_x=ids,attention_mask=masks,labels=labels)[0]
         # step_output_dir = os.path.join("test_output", f"step_{i}")
         # os.makedirs(step_output_dir, exist_ok=True)
         # for t in range(images.shape[1]):
@@ -213,6 +258,8 @@ def examine_data(args):
         #     img = (img * 255).astype(np.uint8)
         #     img = Image.fromarray(img).convert("RGB")
         #     img.save(os.path.join(step_output_dir, f"image_{t}.png"))
+        breakpoint()
+        labels[labels == tokenizer.pad_token_id] = -100
         assert len(batch) == 4
         meta_data = batch[-1]
         # print(len(meta_data)) on each rank, len(batch) == batch_size_mujoco
@@ -220,20 +267,36 @@ def examine_data(args):
         obj_type = meta_data["obj_type"]
         obj_id = meta_data["obj_folder"]
         img_names = meta_data["image_names"]
-        print(f"Rank: {args.rank}, world_size: {args.world_size} | Obj type: {obj_type} | Obj id: {obj_id} | Images: {img_names}")
+        if args.test_fsdp:
+            print(f"Rank: {args.rank}, world_size: {args.world_size} | Obj type: {obj_type} | Obj id: {obj_id} | Images: {img_names}")
+            print(ids.shape, masks.shape)
         # save obj type and folder to file
         fname = os.path.join(output_dir, f"obj_type_{obj_type}_obj_id_{obj_id}.txt")
         # assert not os.path.exists(fname), f"File {fname} already exists!"
         # with open(fname, "w") as f:
         #     f.write("test")
-         
-    exit()
+        raw_lens.append(len(meta_data["text"].split(" ")) * 6.5)
+        raw_text = meta_data["text"].split("\n")
+        
+        # try remove asset lines 
+        raw_text = [t for t in raw_text if "asset.add" not in t and "import" not in t]
+        raw_text = "\n".join(raw_text)
+ 
+        reformated = reformat_text(raw_text)
+        inp_lens.append(len(reformated.split(" ")) * 6.5)
+        if i == 10:
+            break
+        
+    
+    print('Avg input length: ', np.mean(inp_lens))
+ 
+    breakpoint()
      
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mujoco_shards", type=str, default="/local/real/mandi/mobility_shards_v2_emb_loop_0/val/0000.tar")
-    parser.add_argument("--mujoco_val_shards", type=str, default="/local/real/mandi/mobility_shards_v2_loop_0_emb/val/0000.tar")
+    parser.add_argument("--mujoco_shards", type=str, default="/local/real/mandi/mobility_shards_v3/val/0000.tar")
+    parser.add_argument("--mujoco_val_shards", type=str, default="/local/real/mandi/mobility_shards_v3/val/0000.tar")
     parser.add_argument("--val_num_samples_mujoco", type=int, default=160)
 
     parser.add_argument("--dataset_resampled", action="store_true", default=False)
@@ -244,7 +307,14 @@ if __name__ == "__main__":
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--world_size", type=int, default=1)
     parser.add_argument("--no_vis_encoder", action="store_true", default=False)
-
+    parser.add_argument("--no_vision", action="store_true", default=False)
+    parser.add_argument("--use_aug", action="store_true", default=False)
+    parser.add_argument("--load_model", action="store_true", default=False)
+    parser.add_argument("--max_tokens_mujoco", type=int, default=1024)
+    parser.add_argument("--shorten_text", action="store_true", default=False)
+    parser.add_argument("--text_lm", action="store_true", default=False)
+    parser.add_argument("--is_val", action="store_true", default=False)
+    
     parser.add_argument("--test_fsdp", action="store_true", default=False)
     parser.add_argument("--horovod", action="store_true")
     parser.add_argument("--fsdp_sharding_strategy", type=str, default="full")

@@ -12,8 +12,7 @@ from data import get_data
 from distributed import init_distributed_device, world_info_from_env
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from train_utils import (
-    train_one_epoch,
+from train_utils import ( 
     get_mp_policy_dtype,
     save_checkpoint,
     train_one_mujoco_epoch,
@@ -41,7 +40,7 @@ from torch.distributed.fsdp._init_utils import _init_intra_and_inter_node_groups
 from torch.distributed.distributed_c10d import _get_default_group
 import functools
 
-from open_flamingo import create_model_and_transforms
+from open_flamingo import create_model_and_transforms, create_textlm_and_transforms
 
 
 def random_seed(seed=42, rank=0):
@@ -86,9 +85,7 @@ def main():
         "--delete_previous_checkpoint",
         action="store_true",
         help="delete previous checkpoint when saving new checkpoint",
-    )
-    parser.add_argument("--batch_size_mmc4", type=int, default=128)
-    parser.add_argument("--batch_size_laion", type=int, default=128)
+    )  
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--learning_rate", default=1e-4, type=float)
@@ -98,8 +95,7 @@ def main():
         type=str,
         help="constant, linear, or cosine",
     )
-    parser.add_argument("--loss_multiplier_mmc4", type=float, default=1.0)
-    parser.add_argument("--loss_multiplier_laion", type=float, default=1.0)
+     
     parser.add_argument("--loss_multiplier_mujoco", type=float, default=1.0)
     parser.add_argument("--warmup_steps", default=5000, type=int)
     parser.add_argument("--weight_decay", default=0.1, type=float)
@@ -130,39 +126,9 @@ def main():
         "--logging_steps", type=int, default=20, help="log loss every n steps"
     )
 
-    # data args
-    parser.add_argument(
-        "--laion_shards",
-        type=str,
-        help="path to laion shards, this should be a glob pattern such as /path/to/shards/shard-{0000..0999}.tar",
-    )
-    parser.add_argument(
-        "--mmc4_shards",
-        type=str,
-        help="path to c4 shards, this should be a glob pattern such as /path/to/shards/shard-{0000..0999}.tar",
-    )
-    parser.add_argument("--workers", type=int, default=1)
-    parser.add_argument("--train_num_samples_mmc4", type=int, default=10000)
-    parser.add_argument("--train_num_samples_laion", type=int, default=10000)
-    parser.add_argument("--dataset_resampled", action="store_true")
-    parser.add_argument(
-        "--mmc4_textsim_threshold",
-        default=30,
-        type=float,
-        help="threshold for filtering images in mmc4 based on image-text similarity",
-    )
-    parser.add_argument(
-        "--mmc4_max_num_images",
-        default=6,
-        type=int,
-        help="max number of images per sequence in mmc4 / chatgpt",
-    )
-    parser.add_argument(
-        "--mmc4_min_num_images",
-        default=1,
-        type=int,
-        help="min number of images per sequence in mmc4 / chatgpt",
-    )
+    # data args 
+    parser.add_argument("--workers", type=int, default=1) 
+    parser.add_argument("--dataset_resampled", action="store_true") 
 
     # distributed training args
     parser.add_argument(
@@ -240,19 +206,21 @@ def main():
     parser.add_argument(
         "--val_num_samples_mujoco", type=int, default=160
     )
+    parser.add_argument("--shorten_text", action="store_true") # further shorten the text
+    parser.add_argument("--no_vision", action="store_true")
+    parser.add_argument("--max_tokens_mujoco", type=int, default=1024)
+    parser.add_argument("--use_aug", action="store_true")
     parser.add_argument("--no_vis_encoder", action="store_true")
+    parser.add_argument("--text_lm", action="store_true")
+    parser.add_argument("--use_lora", action="store_true")
+    parser.add_argument("--finetune_every_n_layers", type=int, default=4)
+
     parser.add_argument("--batch_size_mujoco", type=int, default=10)
     parser.add_argument("--model_cache_dir", type=str, default="/local/real/mandi/model_cache")
-    parser.add_argument("--save_every_epoch", type=int, default=2)
+    parser.add_argument("--save_every_epoch", type=int, default=1)
     parser.add_argument("--is_val", action="store_true") # for validation dataset
     args = parser.parse_args()
-
-    # Validate args
-    # if args.laion_shards.startswith("s3"):
-    #     args.laion_shards = f"pipe:aws s3 cp {args.laion_shards} -"
-
-    # if args.mmc4_shards.startswith("s3"):
-    #     args.mmc4_shards = f"pipe:aws s3 cp {args.mmc4_shards} -"
+ 
 
     if args.save_checkpoints_to_wandb and not args.report_to_wandb:
         raise ValueError("save_checkpoints_to_wandb requires report_to_wandb")
@@ -272,11 +240,7 @@ def main():
             + "Copy and paste the code from the _optim_utils.py in this repo into the torch file."
             + "The main issue was the missing group kwarg on line 1596 in _all_gather_optim_state."
         )
-
-    # assert (args.train_num_samples_laion // args.batch_size_laion) == (
-    #     args.train_num_samples_mmc4 // args.batch_size_mmc4
-    # ), "number of samples per epoch must be equal for mmc4 and laion"
-
+ 
     # Set up distributed training
     if args.offline:
         os.environ["WANDB_MODE"] = "offline"
@@ -306,18 +270,33 @@ def main():
 
     print(f"Initializing Models")
     # Initialize model
-    model, image_processor, tokenizer = create_model_and_transforms(
-        args.vision_encoder_path,
-        args.vision_encoder_pretrained,
-        args.lm_path,
-        args.tokenizer_path if args.tokenizer_path else args.lm_path,
-        cross_attn_every_n_layers=args.cross_attn_every_n_layers,
-        use_local_files=args.offline,
-        gradient_checkpointing=args.gradient_checkpointing,
-        freeze_lm_embeddings=args.freeze_lm_embeddings,
-        cache_dir=args.model_cache_dir,
-        no_vis_encoder=args.no_vis_encoder,
-    )
+    if args.text_lm:
+        args.no_vision = True # for dataset 
+        model, image_processor, tokenizer = create_textlm_and_transforms(
+            args.lm_path,
+            args.tokenizer_path if args.tokenizer_path else args.lm_path,
+            finetune_every_n_layers=args.finetune_every_n_layers,
+            use_local_files=args.offline,
+            freeze_lm_embeddings=args.freeze_lm_embeddings,
+            cache_dir=args.model_cache_dir,
+            use_lora=args.use_lora,
+            
+        )
+    else:
+        model, image_processor, tokenizer = create_model_and_transforms(
+            args.vision_encoder_path,
+            args.vision_encoder_pretrained,
+            args.lm_path,
+            args.tokenizer_path if args.tokenizer_path else args.lm_path,
+            cross_attn_every_n_layers=args.cross_attn_every_n_layers,
+            use_local_files=args.offline,
+            gradient_checkpointing=args.gradient_checkpointing,
+            freeze_lm_embeddings=args.freeze_lm_embeddings,
+            cache_dir=args.model_cache_dir,
+            no_vis_encoder=args.no_vis_encoder,
+            no_vision=args.no_vision,
+        )
+    
     random_seed(args.seed, args.rank)
     print("Done creating models") 
 
@@ -354,8 +333,7 @@ def main():
     if args.fsdp:
         print(
             f"Before FSDP parameter num: {sum(p.numel() for p in model.parameters())} on rank {args.rank}"
-        )
-
+        ) 
         # init MixedPrecision
         if args.precision != "fp32":
             cast_dtype = get_mp_policy_dtype(args.precision)
@@ -431,6 +409,8 @@ def main():
             params_to_optimize,
         )
     )
+    tot_params = sum([p.numel() for n, p in params_to_optimize])
+    print(f"Optimizing {tot_params/1e9} Billion parameters.")
     if not args.fsdp or args.fsdp_use_orig_params:
         # apply weight decay only to params in the xattn layers
         def get_grouped_params(model):
@@ -454,8 +434,7 @@ def main():
             (p for _, p in params_to_optimize),
             lr=args.learning_rate,
             weight_decay=args.weight_decay,
-        )
-
+        ) 
     # load optimizer checkpoint
     if args.resume_from_checkpoint is not None:
         osd = checkpoint["optimizer_state_dict"]
@@ -463,12 +442,7 @@ def main():
             osd = FSDP.optim_state_dict_to_load(osd, ddp_model, optimizer)
         optimizer.load_state_dict(osd)
 
-    # Initialize data loaders
-    # laion_dataset = get_data(args, image_processor, tokenizer, "image_text")
-    # mmc4_dataset = get_data(args, image_processor, tokenizer, "mmc4")
-    # total_training_steps = (
-    #     (args.train_num_samples_mmc4) // (args.batch_size_mmc4 * args.world_size)
-    # ) * args.num_epochs
+    # Initialize data loaders 
     print("Creating dataset") 
     mujoco_dataset = get_data(args, image_processor, tokenizer, "mujoco")
 
@@ -514,17 +488,7 @@ def main():
         val_dataset.set_epoch(epoch)
         mujoco_val_loader = val_dataset.dataloader
         # ddp_model.eval()
-        log_dict = validate_one_mujoco_epoch(
-            args=args,
-            model=ddp_model,
-            epoch=epoch,
-            tokenizer=tokenizer,
-            optimizer=optimizer,
-            lr_scheduler=lr_scheduler, 
-            val_loader=mujoco_val_loader,
-            device_id=device_id,
-            wandb=wandb,
-        )
+        
         ddp_model.train()
         train_one_mujoco_epoch(
             args=args,
@@ -535,9 +499,21 @@ def main():
             lr_scheduler=lr_scheduler, 
             mujoco_loader=mujoco_loader,
             device_id=device_id,
-            wandb=wandb,
-            val_log_dict=log_dict,
+            wandb=wandb, 
         )
+        log_dict = dict()
+        if epoch > 0:
+            log_dict = validate_one_mujoco_epoch(
+                args=args,
+                model=ddp_model,
+                epoch=epoch,
+                tokenizer=tokenizer,
+                optimizer=optimizer,
+                lr_scheduler=lr_scheduler, 
+                val_loader=mujoco_val_loader,
+                device_id=device_id,
+                wandb=wandb,
+            )
         if epoch % args.save_every_epoch == 0 or epoch == args.num_epochs - 1:
             save_checkpoint(ddp_model, optimizer, lr_scheduler, epoch, args)
 

@@ -288,8 +288,7 @@ def train_one_mujoco_epoch(
     optimizer,
     lr_scheduler,
     device_id,
-    wandb,
-    val_log_dict=dict(),
+    wandb, 
 ):
     num_batches_per_epoch = mujoco_loader.num_batches
     total_training_steps = num_batches_per_epoch * args.num_epochs
@@ -315,7 +314,7 @@ def train_one_mujoco_epoch(
         disable=args.rank != 0,
         total=total_training_steps,
         initial=(epoch * num_batches_per_epoch),
-    ):
+    ): 
         data_time_m.update(time.time() - end)
         global_step = num_steps + epoch * num_batches_per_epoch
 
@@ -356,28 +355,30 @@ def train_one_mujoco_epoch(
                 embed_grad = (
                     model.module.lang_encoder.get_input_embeddings().weight.grad
                 )
-            zero_mask = torch.zeros_like(embed_grad)
-            zero_mask[media_token_id] = torch.ones_like(zero_mask[media_token_id])
-            zero_mask[endofchunk_token_id] = torch.ones_like(
-                zero_mask[endofchunk_token_id]
-            )
-            if args.fsdp:
-                model.lang_encoder.get_input_embeddings().weight.grad = (
-                    embed_grad * zero_mask
+            if not args.text_lm:
+                zero_mask = torch.zeros_like(embed_grad)
+                zero_mask[media_token_id] = torch.ones_like(zero_mask[media_token_id])
+                zero_mask[endofchunk_token_id] = torch.ones_like(
+                    zero_mask[endofchunk_token_id]
                 )
-            else:
-                model.module.lang_encoder.get_input_embeddings().weight.grad = (
-                    embed_grad * zero_mask
-                )
+                if args.fsdp:
+                    model.lang_encoder.get_input_embeddings().weight.grad = (
+                        embed_grad * zero_mask
+                    )
+                else:
+                    model.module.lang_encoder.get_input_embeddings().weight.grad = (
+                        embed_grad * zero_mask
+                    )
         if args.fsdp:
             model.clip_grad_norm_(1.0)
         else:
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         
         # step optimizer and log 
-        if (((num_steps + 1) % args.gradient_accumulation_steps) == 0) or (
-            num_steps == num_batches_per_epoch - 1
-        ):
+        # if (((num_steps + 1) % args.gradient_accumulation_steps) == 0) or (
+        #     num_steps == num_batches_per_epoch - 1
+        # ):
+        if global_step % args.gradient_accumulation_steps == 0:
             optimizer.step()
             lr_scheduler.step()
             optimizer.zero_grad(set_to_none=True)
@@ -422,11 +423,15 @@ def train_one_mujoco_epoch(
                     },
                     commit=True,
                 ) 
-         # Log loss to console
-        if ((num_steps + 1) % args.logging_steps == 0) and args.rank == 0:
-            print(
-                f"Step {num_steps+1}/{num_batches_per_epoch} of epoch {epoch+1}/{args.num_epochs} complete. Loss: {loss.item():.3f}"
-            ) 
+            # Log loss to console
+            if ((num_steps + 1) % args.logging_steps == 0) and args.rank == 0:
+                print(
+                    f"Step {num_steps+1}/{num_batches_per_epoch} of epoch {epoch+1}/{args.num_epochs} complete. Loss: {loss.item():.3f}"
+                ) 
+        # if ((num_steps + 1) % args.logging_steps == 0) and args.rank == 0:
+        #     print(
+        #         f"Step {num_steps+1}/{num_batches_per_epoch} of epoch {epoch+1}/{args.num_epochs} complete. Loss: {loss.item():.3f}"
+        #     ) 
 
 def validate_one_mujoco_epoch(
     args,
